@@ -1,0 +1,26 @@
+[package]
+name = "pool-tunnel"
+version = "1.0.0"
+description = "pool.cn.com 矿池加密连接"
+authors = ["pool.cn.com"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "pool_tunnel_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["time", "sync"] }
+netstat2 = "0.9"

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pool.cn.com矿池加密连接</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    margin: 0; padding: 14px; background: #fff; color: #222;
+    user-select: none;
+  }
+  header { display: flex; justify-content: space-between; align-items: center; }
+  .title { font-size: 16px; font-weight: 600; }
+  .miners { margin-left: 14px; font-weight: 600; color: #2E8B57; }
+  .status-area { display: flex; align-items: center; gap: 6px; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; background: #808080; }
+  .note { color: #CC6600; margin-top: 6px; font-size: 12px; min-height: 16px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 10px; border-bottom: 1px solid #e6e8eb; }
+  .tab { padding: 6px 14px; cursor: pointer; border: 1px solid #e6e8eb; border-bottom: none; border-radius: 6px 6px 0 0; background: #f5f6f8; font-size: 13px; }
+  .tab.active { background: #fff; border-bottom: 2px solid #185FA5; font-weight: 600; }
+  .content { border: 1px solid #e6e8eb; border-top: none; padding: 8px; min-height: 180px; max-height: 260px; overflow-y: auto; }
+  .item { display: flex; align-items: flex-start; padding: 6px 4px; }
+  .item input { margin: 3px 8px 0 2px; }
+  .pool-name { font-weight: 600; font-size: 13px; }
+  .endpoint { color: #666; font-size: 12px; margin-top: 2px; user-select: text; cursor: text; }
+  .endpoint:hover { background: #f0f2f5; }
+  .summary-bar { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+  .summary { font-size: 13px; user-select: text; cursor: text; }
+  .buttons { display: flex; gap: 8px; }
+  button { padding: 6px 16px; border: 1px solid #ccc; border-radius: 4px; background: #fafafa; cursor: pointer; font-size: 13px; }
+  button:hover:not(:disabled) { background: #f0f2f5; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #btnStart { background: #185FA5; color: #fff; border-color: #185FA5; }
+  #btnStart:hover:not(:disabled) { background: #0C447C; }
+  .log-box { margin-top: 12px; border: 1px solid #e6e8eb; border-radius: 6px; }
+  .log-header { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #f5f6f8; font-size: 13px; border-bottom: 1px solid #e6e8eb; }
+  #logArea { margin: 0; padding: 8px 10px; height: 170px; overflow: auto; font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: pre; user-select: text; cursor: text; }
+  .msg-error { color: #DC143C; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title-area">
+    <span class="title">pool.cn.com矿池加密连接 <span id="version"></span></span>
+    <span class="miners" id="miners">在线矿机：0台</span>
+  </div>
+  <div class="status-area">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">未连接</span>
+  </div>
+</header>
+
+<div class="note" id="dataNote"></div>
+
+<div class="tabs" id="tabs"></div>
+<div class="content" id="tabContent"></div>
+
+<div class="summary-bar">
+  <div class="summary" id="summary">已选择 0 个矿池 / 0 个端口</div>
+  <div class="buttons">
+    <button id="btnStart">开始加密连接</button>
+    <button id="btnStop" disabled>停止连接</button>
+    <button id="btnRefresh">刷新列表</button>
+  </div>
+</div>
+
+<div class="log-box">
+  <div class="log-header">加密隧道日志 <button id="btnCopy">复制当前全部日志</button></div>
+  <pre id="logArea"></pre>
+</div>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+
+let groups = [];
+let selected = new Set();
+let tunnelState = 'idle';
+let miners = 0;
+let currentTab = 0;
+let logs = '';
+
+const COLORS = { idle: '#808080', starting: '#DAA520', running: '#2E8B57', failed: '#DC143C' };
+const TEXTS = { idle: '未连接', starting: '连接中...', running: '运行中', failed: '连接失败' };
+
+async function init() {
+  try {
+    const data = await invoke('get_initial_state');
+    groups = data.groups || [];
+    selected = new Set(data.selected || []);
+    tunnelState = data.running ? 'running' : 'idle';
+    renderVersion();
+    renderTabs();
+    renderContent();
+    updateSummary();
+    updateStatus();
+    if (data.groups && data.groups.length === 0) {
+      document.getElementById('dataNote').textContent = '正在加载矿池列表...';
+      // 首次启动无缓存，自动拉取最新配置
+      try {
+        const fresh = await invoke('refresh_config');
+        groups = fresh.groups || [];
+        selected = new Set(fresh.selected || []);
+        renderTabs();
+        renderContent();
+        updateSummary();
+        updateStatus();
+        document.getElementById('dataNote').textContent = '';
+      } catch (e) {
+        document.getElementById('dataNote').textContent = '网络请求失败，请检查网络后重试';
+      }
+    }
+  } catch (e) {
+    document.getElementById('dataNote').textContent = '初始化失败：' + e;
+  }
+  setInterval(pollStatus, 1000);
+  setInterval(pollLogs, 2000);
+}
+
+async function renderVersion() {
+  try {
+    const v = await invoke('get_app_version');
+    document.getElementById('version').textContent = v;
+  } catch (e) { document.getElementById('version').textContent = ''; }
+}
+
+function renderTabs() {
+  const el = document.getElementById('tabs');
+  el.innerHTML = '';
+  groups.forEach((g, i) => {
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (i === currentTab ? ' active' : '');
+    tab.textContent = g.coin;
+    tab.onclick = () => { currentTab = i; renderTabs(); renderContent(); };
+    el.appendChild(tab);
+  });
+}
+
+function renderContent() {
+  const el = document.getElementById('tabContent');
+  el.innerHTML = '';
+  if (groups.length === 0) {
+    el.textContent = '暂无矿池列表';
+    return;
+  }
+  const g = groups[Math.min(currentTab, groups.length - 1)];
+  const running = tunnelState === 'running' || tunnelState === 'starting';
+  g.items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'item';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selected.has(item.key);
+    cb.disabled = running;
+    cb.onchange = () => onCheck(item.key, cb.checked);
+    const info = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'pool-name';
+    name.textContent = item.pool_name;
+    const ep = document.createElement('div');
+    ep.className = 'endpoint';
+    ep.textContent = item.endpoint;
+    info.appendChild(name); info.appendChild(ep);
+    row.appendChild(cb); row.appendChild(info);
+    el.appendChild(row);
+  });
+}
+
+function onCheck(key, checked) {
+  if (checked) selected.add(key); else selected.delete(key);
+  saveSelected();
+  updateSummary();
+  updateStatus();
+}
+
+async function saveSelected() {
+  try { await invoke('set_selected', { selected: Array.from(selected) }); } catch (e) {}
+}
+
+function updateSummary() {
+  const pools = selected.size;
+  const ports = new Set();
+  groups.forEach(g => g.items.forEach(i => { if (selected.has(i.key)) ports.add(i.port); }));
+  document.getElementById('summary').textContent = `已选择 ${pools} 个矿池 / ${ports.size} 个端口`;
+}
+
+async function updateStatus() {
+  const dot = document.getElementById('statusDot');
+  dot.style.background = COLORS[tunnelState] || '#808080';
+  const txt = document.getElementById('statusText');
+  if (tunnelState === 'running') {
+    txt.textContent = TEXTS.running;
+  } else {
+    txt.textContent = TEXTS[tunnelState] || '未连接';
+  }
+  document.getElementById('miners').textContent = `在线矿机：${miners}台`;
+  const running = tunnelState === 'running' || tunnelState === 'starting';
+  document.getElementById('btnStart').disabled = running || selected.size === 0;
+  document.getElementById('btnStop').disabled = !running;
+  // 运行中复选框不可改（renderContent 会处理 disabled）
+  renderContent();
+}
+
+async function pollStatus() {
+  try {
+    const s = await invoke('get_status');
+    const changed = s.state !== tunnelState || s.miners !== miners;
+    tunnelState = s.state;
+    miners = s.miners;
+    if (changed) updateStatus();
+  } catch (e) {}
+}
+
+async function pollLogs() {
+  try {
+    const s = await invoke('get_status');
+    if (s.has_logs) {
+      const text = await invoke('get_logs');
+      if (text !== logs) {
+        logs = text;
+        const area = document.getElementById('logArea');
+        area.textContent = text;
+        area.scrollTop = area.scrollHeight;
+      }
+    }
+  } catch (e) {}
+}
+
+async function doStart() {
+  if (selected.size === 0) return;
+  const btn = document.getElementById('btnStart');
+  btn.disabled = true;
+  const prevState = tunnelState;
+  tunnelState = 'starting';
+  updateStatus();
+  document.getElementById('dataNote').textContent = '正在获取最新服务器配置...';
+  try {
+    const msg = await invoke('start_tunnel', { selected: Array.from(selected) });
+    tunnelState = 'running';
+    document.getElementById('dataNote').textContent = '';
+    document.getElementById('statusText').textContent = msg;
+  } catch (e) {
+    tunnelState = 'failed';
+    document.getElementById('dataNote').textContent = e;
+    const st = document.getElementById('statusText');
+    st.textContent = '连接失败';
+    st.className = 'msg-error';
+    setTimeout(() => { st.className = ''; }, 4000);
+  }
+  updateStatus();
+}
+
+async function doStop() {
+  try {
+    await invoke('stop_tunnel');
+    tunnelState = 'idle';
+    document.getElementById('dataNote').textContent = '';
+    updateStatus();
+  } catch (e) {
+    document.getElementById('dataNote').textContent = '停止失败：' + e;
+  }
+}
+
+async function doRefresh() {
+  const note = document.getElementById('dataNote');
+  note.textContent = '正在刷新列表...';
+  try {
+    const data = await invoke('refresh_config');
+    groups = data.groups || [];
+    selected = new Set(data.selected || []);
+    currentTab = 0;
+    note.textContent = '';
+    renderTabs(); renderContent(); updateSummary();
+    if (data.errors && data.errors.length) note.textContent = '部分行格式非法已跳过：' + data.errors.slice(0, 3).join('；');
+  } catch (e) {
+    note.textContent = e;
+  }
+}
+
+async function doCopy() {
+  try {
+    if (!logs) logs = await invoke('get_logs');
+    await navigator.clipboard.writeText(logs);
+    flash('日志已复制到剪贴板');
+  } catch (e) {
+    flash('复制失败');
+  }
+}
+
+function flash(msg) {
+  const st = document.getElementById('statusText');
+  st.textContent = msg;
+  setTimeout(() => { if (tunnelState === 'idle') st.textContent = '未连接'; else st.textContent = TEXTS[tunnelState]; }, 2000);
+}
+
+document.getElementById('btnStart').onclick = doStart;
+document.getElementById('btnStop').onclick = doStop;
+document.getElementById('btnRefresh').onclick = doRefresh;
+document.getElementById('btnCopy').onclick = doCopy;
+
+init();
+</script>
+</body>
+</html>

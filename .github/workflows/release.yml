@@ -1,0 +1,87 @@
+name: release
+
+# 三平台自动打包：push 代码到 GitHub，打 tag（v*）或手动触发后，
+# 自动在 Windows / macOS / Linux 三台云端机器上分别编译并上传安装包到 Release。
+#
+# 用法：
+#   1. 把 pool-tunnel 目录推到一个 GitHub 仓库（根目录需包含 package.json）
+#   2. 打 tag 触发：git tag v1.0.1 && git push origin v1.0.1
+#      或 在 Actions 页面手动 Run workflow
+#   3. 到仓库 Releases 页面下载三个平台安装包
+#
+# 前提：macOS/Linux 的 gost sidecar 已放在 src-tauri/binaries/（本项目已备好三平台）
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64（gost sidecar: gost-x86_64-pc-windows-msvc.exe）
+          - platform: 'windows-latest'
+            target: 'x86_64-pc-windows-msvc'
+            os_name: 'windows'
+          # macOS Intel x64（gost sidecar: gost-x86_64-apple-darwin）
+          # macos-latest 是 arm64 机器，交叉编译 x86_64 target（macOS clang 原生支持）
+          - platform: 'macos-latest'
+            target: 'x86_64-apple-darwin'
+            os_name: 'macos-intel'
+          # macOS Apple Silicon（M 系列，gost sidecar: gost-aarch64-apple-darwin）
+          # macos-latest 原生 arm64，直接构建
+          - platform: 'macos-latest'
+            target: 'aarch64-apple-darwin'
+            os_name: 'macos-arm64'
+          # Ubuntu x64（gost sidecar: gost-x86_64-unknown-linux-gnu）
+          - platform: 'ubuntu-22.04'
+            target: 'x86_64-unknown-linux-gnu'
+            os_name: 'ubuntu'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 系统依赖（Tauri 2 + WebKitGTK）
+      - name: install linux dependencies
+        if: matrix.os_name == 'ubuntu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: install tauri-cli (npm)
+        run: npm install
+
+      - name: build & release app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'pool-tunnel v__VERSION__'
+          releaseBody: 'pool.cn.com 矿池加密连接 ${{ matrix.os_name }} 版安装包'
+          releaseDraft: true
+          prerelease: false
+          args: '--target ${{ matrix.target }}'

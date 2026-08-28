@@ -1,0 +1,19 @@
+# Rust / Tauri 构建产物
+target/
+
+# Node
+node_modules/
+
+# 运行时生成
+*.log
+
+# 系统
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/
+
+# 注意：src-tauri/binaries/ 下的 gost sidecar（三平台）必须提交，CI 构建依赖它们，不要忽略

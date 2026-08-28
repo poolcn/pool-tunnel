@@ -1,0 +1,12 @@
+{
+  "name": "pool-tunnel",
+  "version": "1.0.0",
+  "description": "pool.cn.com 矿池加密连接 — Rust + Tauri 2 跨平台桌面客户端（Windows / macOS / Ubuntu）。",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
