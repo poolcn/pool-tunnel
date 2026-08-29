@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// 客户端版本号（编译期取自 Cargo.toml 的 version，单一来源）
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// 公网 IP 获取（IPv4 优先）与 online.php 上报
 pub struct Reporter;
 
@@ -30,7 +33,7 @@ impl Reporter {
         None
     }
 
-    /// 上报 ip + miners(总数) + coins(各币种明细) 到 online.php
+    /// 上报 ip + miners(总数) + coins(各币种明细) + version(软件版本) 到 online.php
     pub async fn report(
         &self,
         ip: &str,
@@ -50,6 +53,7 @@ impl Reporter {
                 ("ip", ip),
                 ("miners", &miners.to_string()),
                 ("coins", &coins_json),
+                ("version", APP_VERSION),
             ])
             .send()
             .await

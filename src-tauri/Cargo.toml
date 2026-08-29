@@ -1,6 +1,6 @@
 [package]
 name = "pool-tunnel"
-version = "1.0.0"
+version = "1.0.1"
 description = "pool.cn.com 矿池加密连接"
 authors = ["pool.cn.com"]
 edition = "2021"
