@@ -1,5 +1,8 @@
 fn main() {
+    #[cfg(target_os = "windows")]
     let mut attributes = tauri_build::Attributes::new();
+    #[cfg(not(target_os = "windows"))]
+    let attributes = tauri_build::Attributes::new();
 
     // Windows：requireAdministrator 提权运行，以便启动时写入 Defender 排除路径。
     #[cfg(target_os = "windows")]

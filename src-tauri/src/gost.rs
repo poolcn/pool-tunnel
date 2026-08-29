@@ -5,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
