@@ -4,6 +4,7 @@ mod defender;
 mod gost;
 mod models;
 mod net;
+mod ping;
 mod reporter;
 mod state;
 
@@ -45,6 +46,7 @@ pub fn run() {
             commands::get_logs,
             commands::get_status,
             commands::set_selected,
+            commands::ping_delay,
             commands::get_app_version,
         ])
         .run(tauri::generate_context!())

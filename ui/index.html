@@ -28,7 +28,9 @@
   .endpoint:hover { background: #f0f2f5; }
   .summary-bar { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
   .summary { font-size: 13px; user-select: text; cursor: text; }
-  .buttons { display: flex; gap: 8px; }
+  .buttons { display: flex; gap: 8px; align-items: center; }
+  .delay-item { font-size: 12px; color: #555; white-space: nowrap; }
+  .delay-item b { color: #185FA5; font-weight: 600; }
   button { padding: 6px 16px; border: 1px solid #ccc; border-radius: 4px; background: #fafafa; cursor: pointer; font-size: 13px; }
   button:hover:not(:disabled) { background: #f0f2f5; }
   button:disabled { opacity: .45; cursor: not-allowed; }
@@ -63,6 +65,9 @@
     <button id="btnStart">开始加密连接</button>
     <button id="btnStop" disabled>停止连接</button>
     <button id="btnRefresh">刷新列表</button>
+    <span class="delay-item">加密隧道一延迟：<b id="delay1">--</b> MS</span>
+    <span class="delay-item">加密隧道二延迟：<b id="delay2">--</b> MS</span>
+    <button id="btnPing">重测延迟</button>
   </div>
 </div>
 
@@ -208,8 +213,28 @@ async function pollStatus() {
     const changed = s.state !== tunnelState || s.miners !== miners;
     tunnelState = s.state;
     miners = s.miners;
+    updateDelayDisplay(s.delay1, s.delay2);
     if (changed) updateStatus();
   } catch (e) {}
+}
+
+function updateDelayDisplay(d1, d2) {
+  document.getElementById('delay1').textContent = (d1 === null || d1 === undefined) ? '--' : d1;
+  document.getElementById('delay2').textContent = (d2 === null || d2 === undefined) ? '--' : d2;
+}
+
+async function doPing() {
+  const btn = document.getElementById('btnPing');
+  btn.disabled = true;
+  document.getElementById('delay1').textContent = '...';
+  document.getElementById('delay2').textContent = '...';
+  try {
+    const r = await invoke('ping_delay');
+    updateDelayDisplay(r.delay1, r.delay2);
+  } catch (e) {
+    updateDelayDisplay(null, null);
+  }
+  btn.disabled = false;
 }
 
 async function pollLogs() {
@@ -297,6 +322,7 @@ function flash(msg) {
 document.getElementById('btnStart').onclick = doStart;
 document.getElementById('btnStop').onclick = doStop;
 document.getElementById('btnRefresh').onclick = doRefresh;
+document.getElementById('btnPing').onclick = doPing;
 document.getElementById('btnCopy').onclick = doCopy;
 
 init();

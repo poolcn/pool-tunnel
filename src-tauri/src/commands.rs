@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, State};
@@ -43,6 +43,15 @@ fn state_str(s: TunnelState) -> &'static str {
         TunnelState::Running => "running",
         TunnelState::Failed => "failed",
     }
+}
+
+/// 从 "域名:端口" 提取域名（用于 ping）
+fn ping_host(addr: &str) -> Option<u32> {
+    let host = addr.split(':').next().unwrap_or(addr);
+    if host.is_empty() {
+        return None;
+    }
+    crate::ping::ping_avg(host)
 }
 
 /// 从缓存加载初始列表 + 勾选（启动时前端调用一次）
@@ -132,13 +141,17 @@ pub async fn start_tunnel(
         return Err("服务器配置缺失（server1/server2/gostserver），请更新矿池列表后重试".to_string());
     }
 
-    // 按勾选 key 提取去重端口
+    // 按勾选 key 提取去重端口 + 建立 币种->端口 映射
     let selected_set: HashSet<String> = selected.iter().cloned().collect();
     let mut ports: Vec<u16> = Vec::new();
+    let mut coin_ports: HashMap<String, Vec<u16>> = HashMap::new();
     for g in &groups {
         for e in &g.entries {
-            if selected_set.contains(&e.key()) && !ports.contains(&e.port) {
-                ports.push(e.port);
+            if selected_set.contains(&e.key()) {
+                if !ports.contains(&e.port) {
+                    ports.push(e.port);
+                }
+                coin_ports.entry(e.coin.clone()).or_default().push(e.port);
             }
         }
     }
@@ -149,6 +162,7 @@ pub async fn start_tunnel(
     }
 
     *state.ports.lock().unwrap() = ports.clone();
+    *state.coin_ports.lock().unwrap() = coin_ports;
     state.config.save_selected(&selected);
     state.gost.clear_logs();
 
@@ -170,6 +184,8 @@ pub async fn start_tunnel(
 pub fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.gost.stop(&app);
     state.ports.lock().unwrap().clear();
+    state.coin_ports.lock().unwrap().clear();
+    state.coin_miners.lock().unwrap().clear();
     *state.state.lock().unwrap() = TunnelState::Idle;
     Ok(())
 }
@@ -185,11 +201,17 @@ pub fn get_status(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
     let miners = *state.miners.lock().unwrap();
     let ports = state.ports.lock().unwrap().clone();
     let has_logs = state.gost.has_logs();
+    let delay1 = *state.delay1.lock().unwrap();
+    let delay2 = *state.delay2.lock().unwrap();
+    let coins = state.coin_miners.lock().unwrap().clone();
     Ok(serde_json::json!({
         "state": state_str(cur),
         "miners": miners,
         "ports": ports,
         "has_logs": has_logs,
+        "delay1": delay1,
+        "delay2": delay2,
+        "coins": coins,
     }))
 }
 
@@ -199,12 +221,29 @@ pub fn set_selected(state: State<'_, AppState>, selected: Vec<String>) -> Result
     Ok(())
 }
 
+/// 手动重测延迟：对 server1/server2 各 ping 4 次取平均
+#[tauri::command]
+pub async fn ping_delay(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let server = state.server.lock().unwrap().clone();
+    let (d1, d2) = match server {
+        Some(s) => (ping_host(&s.server1), ping_host(&s.server2)),
+        None => (None, None),
+    };
+    if let Some(v) = d1 {
+        *state.delay1.lock().unwrap() = Some(v);
+    }
+    if let Some(v) = d2 {
+        *state.delay2.lock().unwrap() = Some(v);
+    }
+    Ok(serde_json::json!({ "delay1": d1, "delay2": d2 }))
+}
+
 #[tauri::command]
 pub fn get_app_version() -> String {
     format!("V{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// 后台任务：5s 矿机统计 + 10s 上报（启动即持续上报，含公网 IP 每 10 分钟刷新）
+/// 后台任务：5s 按币种统计矿机 + 10s 上报 + 30s 定时测延迟（启动即持续上报）
 pub fn start_background_tasks(app: AppHandle) {
     // 启动即上报：先取一次公网 IP
     let app_ip = app.clone();
@@ -214,19 +253,33 @@ pub fn start_background_tasks(app: AppHandle) {
         }
     });
 
-    // 5s 矿机统计
+    // 5s 矿机统计（按币种维度）
     let app_miners = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             let st = app_miners.state::<AppState>();
             let ports = st.ports.lock().unwrap().clone();
-            let miners = net::count_established(&ports);
-            *st.miners.lock().unwrap() = miners;
+            let by_port = net::count_by_port(&ports);
+            let coin_ports = st.coin_ports.lock().unwrap().clone();
+            let mut coin_miners: HashMap<String, u32> = HashMap::new();
+            let mut total = 0u32;
+            for (coin, plist) in &coin_ports {
+                let mut c = 0u32;
+                for p in plist {
+                    if let Some(n) = by_port.get(p) {
+                        c += *n;
+                    }
+                }
+                coin_miners.insert(coin.clone(), c);
+                total += c;
+            }
+            *st.coin_miners.lock().unwrap() = coin_miners;
+            *st.miners.lock().unwrap() = total;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
-    // 10s 上报（公网 IP 每 10 分钟刷新一次）
+    // 10s 上报（公网 IP 每 10 分钟刷新一次；含按币种明细）
     let app_report = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut last_ip_refresh = Instant::now() - Duration::from_secs(601);
@@ -240,10 +293,31 @@ pub fn start_background_tasks(app: AppHandle) {
             }
             let ip = st.ip.lock().unwrap().clone();
             let miners = *st.miners.lock().unwrap();
+            let coin_miners = st.coin_miners.lock().unwrap().clone();
             if !ip.is_empty() {
-                let _ = Reporter.report(&ip, miners).await;
+                let _ = Reporter.report(&ip, miners, &coin_miners).await;
             }
             tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    // 30s 定时测延迟（对 server1/server2 各 ping 4 次）
+    let app_ping = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let st = app_ping.state::<AppState>();
+            let server = st.server.lock().unwrap().clone();
+            if let Some(s) = server {
+                let d1 = ping_host(&s.server1);
+                let d2 = ping_host(&s.server2);
+                if let Some(v) = d1 {
+                    *st.delay1.lock().unwrap() = Some(v);
+                }
+                if let Some(v) = d2 {
+                    *st.delay2.lock().unwrap() = Some(v);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
