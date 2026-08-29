@@ -68,32 +68,51 @@ impl GostManager {
         args
     }
 
-    /// 确保 gost 可执行文件就位：exe 同目录存在则复用，否则从内嵌字节释放
-    fn ensure_gost() -> Result<PathBuf, String> {
-        let exe_path = std::env::current_exe().map_err(|e| format!("无法定位程序目录: {}", e))?;
-        let exe_dir = exe_path
-            .parent()
-            .ok_or_else(|| "无法定位程序目录".to_string())?
-            .to_path_buf();
-        let target = exe_dir.join(gost_file_name());
-
-        if target.exists() {
+    /// 确保 gost 可执行文件就位：
+    /// - Windows：exe 同目录（免安装可写），存在则复用，否则从内嵌字节释放
+    /// - macOS/Linux：.app 包内目录只读，改释放到应用数据目录（~/.local/share 或 ~/Library/Application Support）
+    fn ensure_gost(app: &AppHandle) -> Result<PathBuf, String> {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = app; // Windows 用 exe 同目录，不需要数据目录
+            let exe_path = std::env::current_exe().map_err(|e| format!("无法定位程序目录: {}", e))?;
+            let exe_dir = exe_path
+                .parent()
+                .ok_or_else(|| "无法定位程序目录".to_string())?
+                .to_path_buf();
+            let target = exe_dir.join(gost_file_name());
+            if target.exists() {
+                return Ok(target);
+            }
+            fs::write(&target, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
             return Ok(target);
         }
-        fs::write(&target, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
-        #[cfg(unix)]
+        #[cfg(not(target_os = "windows"))]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("设置 gost 权限失败: {}", e))?;
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("无法获取应用数据目录: {}", e))?;
+            fs::create_dir_all(&data_dir).map_err(|e| format!("创建数据目录失败: {}", e))?;
+            let target = data_dir.join(gost_file_name());
+            if target.exists() {
+                return Ok(target);
+            }
+            fs::write(&target, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("设置 gost 权限失败: {}", e))?;
+            }
+            return Ok(target);
         }
-        Ok(target)
     }
 
     /// 启动 gost；成功返回 Ok(())
     pub async fn start(
         &self,
-        _app: &AppHandle,
+        app: &AppHandle,
         ports: &[u16],
         server: &ServerConfig,
     ) -> Result<(), String> {
@@ -107,8 +126,8 @@ impl GostManager {
         // 防御：清理残留 gost 进程，避免端口占用
         self.kill_residual();
 
-        // 确保 gost 就位（同目录存在则用，否则从内嵌释放）
-        let gost_path = Self::ensure_gost()?;
+        // 确保 gost 就位（Windows exe 同目录 / macOS·Linux 应用数据目录，存在则用否则释放）
+        let gost_path = Self::ensure_gost(app)?;
         let args = Self::build_args(ports, server);
 
         let mut cmd = Command::new(&gost_path);

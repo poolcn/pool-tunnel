@@ -54,9 +54,25 @@ fn ping_host(addr: &str) -> Option<u32> {
     crate::ping::ping_avg(host)
 }
 
-/// 从缓存加载初始列表 + 勾选（启动时前端调用一次）
+/// 测量当前 server1/server2 延迟并写入共享状态。
+async fn measure_delays(state: &AppState) -> (Option<u32>, Option<u32>) {
+    let server = state.server.lock().unwrap().clone();
+    let (d1, d2) = match server {
+        Some(s) => (ping_host(&s.server1), ping_host(&s.server2)),
+        None => (None, None),
+    };
+    if let Some(v) = d1 {
+        *state.delay1.lock().unwrap() = Some(v);
+    }
+    if let Some(v) = d2 {
+        *state.delay2.lock().unwrap() = Some(v);
+    }
+    (d1, d2)
+}
+
+/// 从缓存加载初始列表 + 勾选，并在启动时立即测量一次延迟。
 #[tauri::command]
-pub fn get_initial_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_initial_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let mut server = Default::default();
     let groups = if let Some(cache) = state.config.load_cache() {
         let (g, s, _) = state.config.parse(&cache);
@@ -69,11 +85,14 @@ pub fn get_initial_state(state: State<'_, AppState>) -> Result<serde_json::Value
     *state.server.lock().unwrap() = Some(server.clone());
     let ip = state.ip.lock().unwrap().clone();
     let running = *state.state.lock().unwrap() == TunnelState::Running;
+    let (delay1, delay2) = measure_delays(&state).await;
     Ok(serde_json::json!({
         "groups": build_dtos(&groups, &selected, &ip),
         "server_complete": server.is_complete(),
         "selected": selected,
         "running": running,
+        "delay1": delay1,
+        "delay2": delay2,
     }))
 }
 
@@ -89,10 +108,13 @@ pub async fn refresh_config(state: State<'_, AppState>) -> Result<serde_json::Va
     *state.server.lock().unwrap() = Some(server.clone());
     let selected = state.config.load_selected();
     let ip = state.ip.lock().unwrap().clone();
+    let (delay1, delay2) = measure_delays(&state).await;
     Ok(serde_json::json!({
         "groups": build_dtos(&groups, &selected, &ip),
         "server": server,
         "errors": errors,
+        "delay1": delay1,
+        "delay2": delay2,
     }))
 }
 
@@ -221,20 +243,10 @@ pub fn set_selected(state: State<'_, AppState>, selected: Vec<String>) -> Result
     Ok(())
 }
 
-/// 手动重测延迟：对 server1/server2 各 ping 4 次取平均
+/// 手动重测延迟：对 server1/server2 各 ping 4 次取平均。
 #[tauri::command]
 pub async fn ping_delay(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let server = state.server.lock().unwrap().clone();
-    let (d1, d2) = match server {
-        Some(s) => (ping_host(&s.server1), ping_host(&s.server2)),
-        None => (None, None),
-    };
-    if let Some(v) = d1 {
-        *state.delay1.lock().unwrap() = Some(v);
-    }
-    if let Some(v) = d2 {
-        *state.delay2.lock().unwrap() = Some(v);
-    }
+    let (d1, d2) = measure_delays(&state).await;
     Ok(serde_json::json!({ "delay1": d1, "delay2": d2 }))
 }
 
@@ -301,22 +313,13 @@ pub fn start_background_tasks(app: AppHandle) {
         }
     });
 
-    // 30s 定时测延迟（对 server1/server2 各 ping 4 次）
+    // 30s 定时测延迟；启动首次测量由 get_initial_state 完成。
     let app_ping = app.clone();
     tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
         loop {
             let st = app_ping.state::<AppState>();
-            let server = st.server.lock().unwrap().clone();
-            if let Some(s) = server {
-                let d1 = ping_host(&s.server1);
-                let d2 = ping_host(&s.server2);
-                if let Some(v) = d1 {
-                    *st.delay1.lock().unwrap() = Some(v);
-                }
-                if let Some(v) = d2 {
-                    *st.delay2.lock().unwrap() = Some(v);
-                }
-            }
+            let _ = measure_delays(&st).await;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });

@@ -95,6 +95,7 @@ async function init() {
     groups = data.groups || [];
     selected = new Set(data.selected || []);
     tunnelState = data.running ? 'running' : 'idle';
+    updateDelayDisplay(data.delay1, data.delay2);
     renderVersion();
     renderTabs();
     renderContent();
@@ -111,6 +112,7 @@ async function init() {
         renderContent();
         updateSummary();
         updateStatus();
+        updateDelayDisplay(fresh.delay1, fresh.delay2);
         document.getElementById('dataNote').textContent = '';
       } catch (e) {
         document.getElementById('dataNote').textContent = '网络请求失败，请检查网络后重试';
