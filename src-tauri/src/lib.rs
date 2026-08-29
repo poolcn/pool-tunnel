@@ -21,7 +21,6 @@ pub fn run() {
                 let _ = win.set_focus();
             }
         }))
-        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let data_dir: PathBuf = app
                 .path()

@@ -34,9 +34,6 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
-    "externalBin": [
-      "binaries/gost"
-    ],
     "category": "Utility",
     "shortDescription": "pool.cn.com 矿池加密连接",
     "longDescription": "pool.cn.com 矿池加密隧道客户端：拉取矿池列表、按币种选择端口、启动内嵌 GOST 建立加密转发隧道，支持在线矿机统计与上报。",

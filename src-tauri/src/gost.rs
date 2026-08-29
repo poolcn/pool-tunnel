@@ -1,9 +1,11 @@
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
 use tauri::AppHandle;
-use tauri_plugin_shell::process::{CommandChild, CommandEvent};
-use tauri_plugin_shell::ShellExt;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -12,9 +14,29 @@ use crate::models::ServerConfig;
 
 pub const MAX_LOG_LINES: usize = 500;
 
-/// GOST sidecar 进程管理：命令构建、启动、日志采集（脱敏）、停止/残留清理
+// ---- 编译期内嵌对应平台的 gost 二进制（单 EXE 自包含） ----
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const GOST_BIN: &[u8] = include_bytes!("../binaries/gost-x86_64-pc-windows-msvc.exe");
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const GOST_BIN: &[u8] = include_bytes!("../binaries/gost-x86_64-apple-darwin");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GOST_BIN: &[u8] = include_bytes!("../binaries/gost-aarch64-apple-darwin");
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const GOST_BIN: &[u8] = include_bytes!("../binaries/gost-x86_64-unknown-linux-gnu");
+
+/// gost 可执行文件名（Windows 带 .exe）
+#[cfg(target_os = "windows")]
+fn gost_file_name() -> &'static str {
+    "gost.exe"
+}
+#[cfg(not(target_os = "windows"))]
+fn gost_file_name() -> &'static str {
+    "gost"
+}
+
+/// GOST 进程管理：单 EXE 内嵌二进制、运行时释放、命令构建、日志采集（脱敏）、停止/残留清理
 pub struct GostManager {
-    child: Mutex<Option<CommandChild>>,
+    child: Mutex<Option<Child>>,
     logs: Arc<Mutex<Vec<String>>>,
 }
 
@@ -46,8 +68,35 @@ impl GostManager {
         args
     }
 
-    /// 启动 sidecar；成功返回 Ok(())
-    pub async fn start(&self, app: &AppHandle, ports: &[u16], server: &ServerConfig) -> Result<(), String> {
+    /// 确保 gost 可执行文件就位：exe 同目录存在则复用，否则从内嵌字节释放
+    fn ensure_gost() -> Result<PathBuf, String> {
+        let exe_path = std::env::current_exe().map_err(|e| format!("无法定位程序目录: {}", e))?;
+        let exe_dir = exe_path
+            .parent()
+            .ok_or_else(|| "无法定位程序目录".to_string())?
+            .to_path_buf();
+        let target = exe_dir.join(gost_file_name());
+
+        if target.exists() {
+            return Ok(target);
+        }
+        fs::write(&target, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("设置 gost 权限失败: {}", e))?;
+        }
+        Ok(target)
+    }
+
+    /// 启动 gost；成功返回 Ok(())
+    pub async fn start(
+        &self,
+        _app: &AppHandle,
+        ports: &[u16],
+        server: &ServerConfig,
+    ) -> Result<(), String> {
         {
             let guard = self.child.lock().map_err(|_| "内部锁错误".to_string())?;
             if guard.is_some() {
@@ -56,60 +105,79 @@ impl GostManager {
         }
 
         // 防御：清理残留 gost 进程，避免端口占用
-        self.kill_residual(app);
+        self.kill_residual();
 
+        // 确保 gost 就位（同目录存在则用，否则从内嵌释放）
+        let gost_path = Self::ensure_gost()?;
         let args = Self::build_args(ports, server);
-        let cmd = app
-            .shell()
-            .sidecar("gost")
-            .map_err(|e| e.to_string())?
-            .args(&args);
-        let (mut rx, child) = cmd.spawn().map_err(|e| e.to_string())?;
-        *self.child.lock().map_err(|_| "内部锁错误".to_string())? = Some(child);
 
-        // 后台异步读取 stdout/stderr，脱敏后写入日志缓冲
-        let logs = Arc::clone(&self.logs);
-        tauri::async_runtime::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    CommandEvent::Stdout(bytes) => {
-                        push_log(&logs, String::from_utf8_lossy(&bytes).into_owned());
+        let mut cmd = Command::new(&gost_path);
+        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+        let mut child = cmd.spawn().map_err(|e| format!("启动 gost 失败: {}", e))?;
+
+        // 后台线程读取 stdout/stderr，脱敏后写入日志缓冲
+        let logs_out = Arc::clone(&self.logs);
+        if let Some(stdout) = child.stdout.take() {
+            tauri::async_runtime::spawn_blocking(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        push_log(&logs_out, l);
                     }
-                    CommandEvent::Stderr(bytes) => {
-                        push_log(&logs, String::from_utf8_lossy(&bytes).into_owned());
-                    }
-                    CommandEvent::Terminated(_) => break,
-                    _ => {}
                 }
-            }
-        });
+            });
+        }
+        let logs_err = Arc::clone(&self.logs);
+        if let Some(stderr) = child.stderr.take() {
+            tauri::async_runtime::spawn_blocking(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        push_log(&logs_err, l);
+                    }
+                }
+            });
+        }
 
+        *self.child.lock().map_err(|_| "内部锁错误".to_string())? = Some(child);
         Ok(())
     }
 
-    /// 停止：优先正常结束等待 3s，未退出则强杀；随后按进程名清理残留
-    pub fn stop(&self, app: &AppHandle) {
+    /// 停止：Windows 杀整个进程树；unix kill；随后按进程名清理残留
+    pub fn stop(&self, _app: &AppHandle) {
         let child = self.child.lock().unwrap().take();
         if let Some(c) = child {
-            let _ = c.kill();
+            #[cfg(target_os = "windows")]
+            {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &c.id().to_string()])
+                    .creation_flags(0x08000000)
+                    .output();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let mut c = c;
+                let _ = c.kill();
+            }
         }
-        self.kill_residual(app);
+        self.kill_residual();
     }
 
-    /// 按 sidecar 进程名清理残留（Windows 用 taskkill /T /F 兜底子进程树）
-    fn kill_residual(&self, _app: &AppHandle) {
+    /// 按进程名清理残留（Windows 用 taskkill /T /F；unix 用 pkill -x）
+    fn kill_residual(&self) {
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/IM", "gost-x86_64-pc-windows-msvc.exe"])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/IM", "gost.exe"])
+                .creation_flags(0x08000000)
                 .output();
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = std::process::Command::new("pkill")
-                .args(["-f", "gost-"])
-                .output();
+            let _ = Command::new("pkill").args(["-x", "gost"]).output();
         }
     }
 
