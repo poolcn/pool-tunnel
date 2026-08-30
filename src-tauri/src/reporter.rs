@@ -61,11 +61,81 @@ fn detect_os_version() -> String {
         .clone()
 }
 
-/// 公网 IP 获取（IPv4 优先）与 online.php 上报
+/// 分离获取本机内网 IPv4 与公网出口 IPv4，并向 online.php 上报
 pub struct Reporter;
 
+fn is_private_ipv4(value: &str) -> bool {
+    let octets: Vec<u8> = value.split('.').filter_map(|v| v.parse().ok()).collect();
+    if octets.len() != 4 || octets[0] == 127 || octets[0] == 169 && octets[1] == 254 {
+        return false;
+    }
+    matches!(octets[0], 10 | 192) || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+}
+
+fn extract_ipv4(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .filter_map(|token| token.split('/').next())
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
+        .find(|token| is_private_ipv4(token))
+        .map(ToString::to_string)
+}
+
+/// 依据系统路由表找到第一条默认 IPv4 出口，再读取该接口的第一个内网 IPv4。
+/// 不访问公网 IP 查询服务；失败时返回 None，由调用方保留原有空地址兜底。
+fn get_default_lan_ip() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile", "-NonInteractive", "-Command",
+                "(Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null} | Sort-Object InterfaceIndex | Select-Object -First 1).IPv4Address.IPAddress",
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+        return extract_ipv4(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let route = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
+        let route_text = String::from_utf8_lossy(&route.stdout);
+        let interface = route_text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("interface: "))?
+            .trim();
+        let output = Command::new("ipconfig").args(["getifaddr", interface]).output().ok()?;
+        return extract_ipv4(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let route = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
+        let route_text = String::from_utf8_lossy(&route.stdout);
+        let interface = route_text
+            .lines()
+            .find_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                parts.windows(2).find(|pair| pair[0] == "dev").map(|pair| pair[1])
+            })?;
+        let output = Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "dev", interface, "scope", "global"])
+            .output()
+            .ok()?;
+        return extract_ipv4(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 impl Reporter {
-    /// 获取公网 IPv4：先 api-ipv4.ip.sb，失败回退 api.ip.sb
+    /// 获取默认网络出口网卡的第一个内网 IPv4，仅用于矿机连接地址显示。
+    pub fn get_local_ip(&self) -> Option<String> {
+        get_default_lan_ip()
+    }
+
+    /// 获取公网出口 IPv4，仅用于向 online.php 上报客户端公网来源地址。
     pub async fn get_public_ip(&self) -> Option<String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))

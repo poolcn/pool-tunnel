@@ -17,7 +17,10 @@ pub struct AppState {
     pub coin_ports: Mutex<HashMap<String, Vec<u16>>>,
     /// 币种 -> 在线矿机数
     pub coin_miners: Mutex<HashMap<String, u32>>,
-    pub ip: Mutex<String>,
+    /// 本机默认出口网卡内网 IPv4，仅用于 UI 显示
+    pub lan_ip: Mutex<String>,
+    /// 公网出口 IPv4，仅用于 online.php 上报
+    pub public_ip: Mutex<String>,
     pub miners: Mutex<u32>,
     /// 加密隧道一（server1）延迟 ms
     pub delay1: Mutex<Option<u32>>,
@@ -35,7 +38,8 @@ impl AppState {
             ports: Mutex::new(Vec::new()),
             coin_ports: Mutex::new(HashMap::new()),
             coin_miners: Mutex::new(HashMap::new()),
-            ip: Mutex::new(String::new()),
+            lan_ip: Mutex::new(String::new()),
+            public_ip: Mutex::new(String::new()),
             miners: Mutex::new(0),
             delay1: Mutex::new(None),
             delay2: Mutex::new(None),

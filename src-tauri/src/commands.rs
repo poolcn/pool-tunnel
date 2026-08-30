@@ -83,7 +83,7 @@ pub async fn get_initial_state(state: State<'_, AppState>) -> Result<serde_json:
     };
     let selected = state.config.load_selected();
     *state.server.lock().unwrap() = Some(server.clone());
-    let ip = state.ip.lock().unwrap().clone();
+    let ip = state.lan_ip.lock().unwrap().clone();
     let running = *state.state.lock().unwrap() == TunnelState::Running;
     let (delay1, delay2) = measure_delays(&state).await;
     Ok(serde_json::json!({
@@ -107,7 +107,7 @@ pub async fn refresh_config(state: State<'_, AppState>) -> Result<serde_json::Va
     state.config.save_cache(&content);
     *state.server.lock().unwrap() = Some(server.clone());
     let selected = state.config.load_selected();
-    let ip = state.ip.lock().unwrap().clone();
+    let ip = state.lan_ip.lock().unwrap().clone();
     let (delay1, delay2) = measure_delays(&state).await;
     Ok(serde_json::json!({
         "groups": build_dtos(&groups, &selected, &ip),
@@ -257,11 +257,19 @@ pub fn get_app_version() -> String {
 
 /// 后台任务：5s 按币种统计矿机 + 10s 上报 + 30s 定时测延迟（启动即持续上报）
 pub fn start_background_tasks(app: AppHandle) {
-    // 启动即上报：先取一次公网 IP
-    let app_ip = app.clone();
+    // 启动时读取本机默认出口网卡内网 IP，仅用于 UI 显示。
+    let app_lan_ip = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(ip) = Reporter.get_local_ip() {
+            *app_lan_ip.state::<AppState>().lan_ip.lock().unwrap() = ip;
+        }
+    });
+
+    // 启动即上报：单独获取公网出口 IP，仅用于 online.php 上报。
+    let app_public_ip = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Some(ip) = Reporter.get_public_ip().await {
-            *app_ip.state::<AppState>().ip.lock().unwrap() = ip;
+            *app_public_ip.state::<AppState>().public_ip.lock().unwrap() = ip;
         }
     });
 
@@ -291,19 +299,19 @@ pub fn start_background_tasks(app: AppHandle) {
         }
     });
 
-    // 10s 上报（公网 IP 每 10 分钟刷新一次；含按币种明细）
+    // 10s 上报（公网出口 IP 每 10 分钟刷新一次；含按币种明细）
     let app_report = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut last_ip_refresh = Instant::now() - Duration::from_secs(601);
+        let mut last_public_ip_refresh = Instant::now() - Duration::from_secs(601);
         loop {
             let st = app_report.state::<AppState>();
-            if last_ip_refresh.elapsed() >= Duration::from_secs(600) {
+            if last_public_ip_refresh.elapsed() >= Duration::from_secs(600) {
                 if let Some(ip) = Reporter.get_public_ip().await {
-                    *st.ip.lock().unwrap() = ip.clone();
-                    last_ip_refresh = Instant::now();
+                    *st.public_ip.lock().unwrap() = ip;
+                    last_public_ip_refresh = Instant::now();
                 }
             }
-            let ip = st.ip.lock().unwrap().clone();
+            let ip = st.public_ip.lock().unwrap().clone();
             let miners = *st.miners.lock().unwrap();
             let coin_miners = st.coin_miners.lock().unwrap().clone();
             if !ip.is_empty() {
