@@ -85,3 +85,24 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: '--target ${{ matrix.target }}'
+
+      # Windows 同时发布免安装原始 EXE。
+      # tauri-action 的 NSIS/MSI 资产是安装包，不满足直接运行的要求；
+      # 这里上传 target release 目录中的原始程序文件。
+      - name: publish portable Windows executable
+        if: matrix.os_name == 'windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $source = "src-tauri/target/${{ matrix.target }}/release/pool-tunnel.exe"
+          $version = (Select-String -Path "src-tauri/Cargo.toml" -Pattern '^version = "([^"]+)"$').Matches.Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Unable to read application version from src-tauri/Cargo.toml"
+          }
+          $portable = "pool-tunnel_$version.exe"
+          if (-not (Test-Path $source)) {
+            throw "Portable executable not found: $source"
+          }
+          Copy-Item $source $portable -Force
+          gh release upload "${{ github.ref_name }}" $portable --repo "${{ github.repository }}" --clobber
