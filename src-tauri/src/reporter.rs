@@ -80,20 +80,87 @@ fn extract_ipv4(text: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// 从 Windows `route print -4` 的活动路由中提取第一条默认路由的接口 IPv4。
+/// 典型行：`0.0.0.0  0.0.0.0  192.168.168.1  192.168.168.155  35`。
+fn extract_windows_default_route_ip(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
+            let interface_ip = parts[3].trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+            if is_private_ipv4(interface_ip) {
+                return Some(interface_ip.to_string());
+            }
+        }
+        None
+    })
+}
+
 /// 依据系统路由表找到第一条默认 IPv4 出口，再读取该接口的第一个内网 IPv4。
 /// 不访问公网 IP 查询服务；失败时返回 None，由调用方保留原有空地址兜底。
 fn get_default_lan_ip() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("powershell")
+        // 第一优先级：直接读取 Windows 活动 IPv4 路由表，取默认路由的接口地址。
+        if let Ok(output) = Command::new("route")
+            .args(["print", "-4"])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if let Some(ip) = extract_windows_default_route_ip(&text) {
+                    return Some(ip);
+                }
+            }
+        }
+
+        // 第二优先级：PowerShell 获取存在默认网关的网卡 IPv4。
+        if let Ok(output) = Command::new("powershell")
             .args([
                 "-NoProfile", "-NonInteractive", "-Command",
                 "(Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null} | Sort-Object InterfaceIndex | Select-Object -First 1).IPv4Address.IPAddress",
             ])
             .creation_flags(0x08000000)
             .output()
-            .ok()?;
-        return extract_ipv4(&String::from_utf8_lossy(&output.stdout));
+        {
+            if output.status.success() {
+                if let Some(ip) = extract_ipv4(&String::from_utf8_lossy(&output.stdout)) {
+                    return Some(ip);
+                }
+            }
+        }
+
+        // 第三优先级：解析 ipconfig 中包含默认网关的适配器 IPv4。
+        if let Ok(output) = Command::new("ipconfig")
+            .creation_flags(0x08000000)
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut candidate = None;
+                let mut has_gateway = false;
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        has_gateway = false;
+                        candidate = None;
+                        continue;
+                    }
+                    if trimmed.contains("IPv4") && trimmed.contains(':') {
+                        candidate = extract_ipv4(trimmed);
+                    } else if trimmed.contains("默认网关") || trimmed.contains("Default Gateway") {
+                        has_gateway = extract_ipv4(trimmed).is_some();
+                    }
+                    if has_gateway {
+                        if let Some(ip) = candidate.take() {
+                            return Some(ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        return None;
     }
 
     #[cfg(target_os = "macos")]
