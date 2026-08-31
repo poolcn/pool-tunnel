@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::models::{CoinGroup, CoinGroupDto, PoolItemDto, TunnelState};
 use crate::net;
@@ -110,6 +110,24 @@ pub async fn get_initial_state(state: State<'_, AppState>) -> Result<serde_json:
         "running": running,
         "delay1": delay1,
         "delay2": delay2,
+    }))
+}
+
+/// 轻量刷新：用缓存的池列表 + 当前 lan_ip 重新构建 DTO，不重拉 pool.txt、不重测延迟。
+/// 用于 lan-ip-updated 事件回调：内网IP异步就绪或变更后，让 UI 立即拿到正确的 endpoint 文本。
+#[tauri::command]
+pub fn rebuild_groups_with_lan_ip(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let groups = if let Some(cache) = state.config.load_cache() {
+        let (g, _, _) = state.config.parse(&cache);
+        g
+    } else {
+        Vec::new()
+    };
+    let selected = state.config.load_selected();
+    let ip = state.lan_ip.lock().unwrap().clone();
+    Ok(serde_json::json!({
+        "groups": build_dtos(&groups, &selected, &ip),
+        "lan_ip": ip,
     }))
 }
 
@@ -301,6 +319,8 @@ pub fn start_background_tasks(app: AppHandle) {
             Some(ip) => {
                 *st.lan_ip.lock().unwrap() = ip.clone();
                 log_event(&*st, format!("内网IP检测成功: {}", ip));
+                // 通知前端刷新 endpoint，修复 init() 调用先于 lan_ip 就绪的竞态
+                let _ = app_lan_ip.emit("lan-ip-updated", &ip);
             }
             None => log_event(&*st, "内网IP检测失败（route/PowerShell/ipconfig 均未命中）".to_string()),
         }
@@ -415,6 +435,8 @@ pub fn start_background_tasks(app: AppHandle) {
                 };
                 if changed {
                     log_event(&*st, format!("内网IP已更新: {}", ip));
+                    // 内网IP变更（DHCP续租/网络切换）通知前端刷新 endpoint
+                    let _ = app_ping.emit("lan-ip-updated", &ip);
                 }
             }
             tokio::time::sleep(Duration::from_secs(30)).await;

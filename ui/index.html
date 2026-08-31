@@ -90,6 +90,20 @@ const COLORS = { idle: '#808080', starting: '#DAA520', running: '#2E8B57', faile
 const TEXTS = { idle: '未连接', starting: '连接中...', running: '运行中', failed: '连接失败' };
 
 async function init() {
+  // 注册内网IP异步就绪/变更事件：后端 lan_ip 就绪后通过 'lan-ip-updated' 通知前端，
+  // 前端用最新的 lan_ip 重新构建 endpoint 文案，避免 init() 时序竞态导致的「未检测到」长期显示。
+  try {
+    window.__TAURI__.event.listen('lan-ip-updated', async () => {
+      try {
+        const data = await invoke('rebuild_groups_with_lan_ip');
+        groups = data.groups || [];
+        renderTabs();
+        renderContent();
+        updateSummary();
+      } catch (e) { /* 静默忽略，避免日志刷屏 */ }
+    });
+  } catch (e) { /* listen 失败不影响主流程 */ }
+
   try {
     const data = await invoke('get_initial_state');
     groups = data.groups || [];

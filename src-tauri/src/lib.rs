@@ -40,6 +40,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_initial_state,
             commands::refresh_config,
+            commands::rebuild_groups_with_lan_ip,
             commands::start_tunnel,
             commands::stop_tunnel,
             commands::get_logs,
