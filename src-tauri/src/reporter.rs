@@ -10,18 +10,40 @@ use std::os::windows::process::CommandExt;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 获取操作系统版本；命令不可用或读取失败时返回稳定的系统名称兜底值。
+/// Windows 上使用 systeminfo 的 "OS 名称" 行（如「Microsoft Windows 11 专业版」），并用 decode_console
+/// 解码中文控制台的 GBK 输出，避免 from_utf8_lossy 把"[版]"或"专业版"打成 U+FFFD。
 fn detect_os_version() -> String {
     static OS_VERSION: OnceLock<String> = OnceLock::new();
     OS_VERSION
         .get_or_init(|| {
             #[cfg(target_os = "windows")]
             {
-                let output = Command::new("cmd")
+                // 优先 systeminfo 的 "OS 名称:" 行（含「专业版」「家庭版」等中文 SKU，需 GBK 解码）
+                if let Ok(output) = Command::new("systeminfo").output() {
+                    let text = decode_console(&output.stdout);
+                    for line in text.lines() {
+                        let line = line.trim();
+                        // 注意是中文冒号「：」——systeminfo 中文 Windows 输出是 GBK
+                        if line.starts_with("OS 名称")
+                            || line.starts_with("OS Name")
+                            || line.starts_with("OS名称")
+                        {
+                            if let Some((_, value)) = line.split_once(':').or_else(|| line.split_once('：')) {
+                                let v = value.trim();
+                                if !v.is_empty() {
+                                    return v.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+                // 回退 ver（GBK 解码，避开 from_utf8_lossy 的 U+FFFD）
+                if let Ok(output) = Command::new("cmd")
                     .args(["/C", "ver"])
                     .creation_flags(0x08000000)
-                    .output();
-                if let Ok(output) = output {
-                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    .output()
+                {
+                    let text = decode_console(&output.stdout).trim().to_string();
                     if !text.is_empty() {
                         return text;
                     }
