@@ -64,35 +64,144 @@ fn detect_os_version() -> String {
 /// 分离获取本机内网 IPv4 与公网出口 IPv4，并向 online.php 上报
 pub struct Reporter;
 
-fn is_private_ipv4(value: &str) -> bool {
-    let octets: Vec<u8> = value.split('.').filter_map(|v| v.parse().ok()).collect();
-    if octets.len() != 4 || octets[0] == 127 || octets[0] == 169 && octets[1] == 254 {
-        return false;
+/// 严格解析 "a.b.c.d" 为 4 个 0-255 的八位组；畸形输入（段数不等于 4、非数字、超 255）一律拒绝。
+fn parse_ipv4_octets(value: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() != 4 {
+        return None;
     }
-    matches!(octets[0], 10 | 192) || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+    let mut octets = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        octets[i] = p.parse::<u8>().ok()?;
+    }
+    Some(octets)
 }
 
-fn extract_ipv4(text: &str) -> Option<String> {
+/// RFC1918 三段私网地址：10/8、172.16/12、192.168/16。
+fn is_rfc1918_ipv4(value: &str) -> bool {
+    match parse_ipv4_octets(value) {
+        Some([10, _, _, _]) => true,
+        Some([172, b, _, _]) => (16..=31).contains(&b),
+        Some([192, 168, _, _]) => true,
+        _ => false,
+    }
+}
+
+/// 宽松局域网判定：RFC1918 之外额外接受运营商级 NAT 段 100.64.0.0/10
+/// （校园网/酒店/部分运营商家宽下网卡地址即此段，矿机同段内仍可互通）。
+fn is_lan_ipv4(value: &str) -> bool {
+    if is_rfc1918_ipv4(value) {
+        return true;
+    }
+    matches!(parse_ipv4_octets(value), Some([100, b, _, _]) if (64..=127).contains(&b))
+}
+
+/// 可作为"存在默认网关"证据的 IPv4：排除回环、APIPA（169.254，DHCP 失败自动地址）、
+/// 未指定地址与组播/保留段。网关本身允许是 CGNAT 或公网地址。
+fn is_usable_ipv4(value: &str) -> bool {
+    match parse_ipv4_octets(value) {
+        Some([0, _, _, _]) | Some([127, _, _, _]) => false,
+        Some([169, 254, _, _]) => false,
+        Some([a, _, _, _]) if a >= 224 => false,
+        other => other.is_some(),
+    }
+}
+
+/// 控制台命令输出解码：优先按 UTF-8（纯 ASCII 或系统开了 UTF-8 代码页时直接正确），
+/// 失败时按 GBK 解码（中文 Windows 的 OEM 936 控制台输出）。
+/// 旧实现 from_utf8_lossy 会把"默认网关"等中文标签打成乱码，导致 ipconfig 阶段在
+/// 中文系统上永远匹配不到网关行——本次修复的关键点之一。
+fn decode_console(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GBK.decode(bytes).0.to_string(),
+    }
+}
+
+/// 从文本 token 中提取第一个满足谓词的 IPv4（自动剥离括号后缀如 "(首选)"）。
+fn extract_ipv4_where<F: Fn(&str) -> bool>(text: &str, pred: F) -> Option<String> {
     text.split_whitespace()
-        .filter_map(|token| token.split('/').next())
+        .map(|token| token.split('/').next().unwrap_or(token))
         .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
-        .find(|token| is_private_ipv4(token))
+        .find(|token| pred(token))
         .map(ToString::to_string)
 }
 
-/// 从 Windows `route print -4` 的活动路由中提取第一条默认路由的接口 IPv4。
+fn extract_lan_ipv4(text: &str) -> Option<String> {
+    extract_ipv4_where(text, is_lan_ipv4)
+}
+
+/// 从 Windows `route print -4` 的活动路由中选默认路由的接口 IPv4。
+/// 多条默认路由（物理网卡 + VPN/虚拟网卡）时：优先 RFC1918 地址的行，再按跃点数（实际出口优先级）取最小。
 /// 典型行：`0.0.0.0  0.0.0.0  192.168.168.1  192.168.168.155  35`。
 fn extract_windows_default_route_ip(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
+    let mut best: Option<(bool, u32, String)> = None; // (是否RFC1918, 跃点数, 接口IP)
+    for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 4 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
             let interface_ip = parts[3].trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-            if is_private_ipv4(interface_ip) {
-                return Some(interface_ip.to_string());
+            // PPP 拨号默认路由的接口地址是本端 PPP 地址（公网/CGNAT），is_lan_ipv4 拒绝后交给后续阶段
+            if !is_lan_ipv4(interface_ip) {
+                continue;
+            }
+            let strict = is_rfc1918_ipv4(interface_ip);
+            let metric: u32 = parts.get(4).and_then(|m| m.parse().ok()).unwrap_or(u32::MAX);
+            let better = match &best {
+                None => true,
+                Some((b_strict, b_metric, _)) => {
+                    (strict && !*b_strict) || (strict == *b_strict && metric < *b_metric)
+                }
+            };
+            if better {
+                best = Some((strict, metric, interface_ip.to_string()));
             }
         }
-        None
-    })
+    }
+    best.map(|(_, _, ip)| ip)
+}
+
+/// 解析 `ipconfig` 输出。两轮择优（严格/宽松），兼容多类网络环境：
+/// 1) 有默认网关的适配器 + 严格 RFC1918（标准家庭/办公网络，正常路径）
+/// 2) 同上但宽松接受 CGNAT（100.64.x 网络：网关与本机地址均非 RFC1918）
+/// 3) 任意适配器 + RFC1918（PPPoE 直拨 + 无网关局域网卡的多网卡矿机：矿机应连的卡没有网关）
+/// 4) 任意适配器 + 宽松局域网（最后兜底）
+fn extract_ipconfig_ip(text: &str, relaxed: bool) -> Option<String> {
+    // 轮 1/2：带网关的适配器。IPv4 行先记候选，同适配器块内出现网关行即命中。
+    let mut candidate: Option<String> = None;
+    let mut has_gateway = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            has_gateway = false;
+            candidate = None;
+            continue;
+        }
+        if trimmed.contains("IPv4") && trimmed.contains(':') {
+            if relaxed {
+                candidate = extract_lan_ipv4(trimmed);
+            } else {
+                candidate = extract_ipv4_where(trimmed, is_rfc1918_ipv4);
+            }
+        } else if trimmed.contains("Default Gateway") || trimmed.contains("网关") {
+            // 网关地址本身可以是 CGNAT/公网，只要是可用 IPv4 即证明该适配器可对外
+            has_gateway = extract_ipv4_where(trimmed, is_usable_ipv4).is_some();
+        }
+        if has_gateway {
+            if let Some(ip) = candidate.take() {
+                return Some(ip);
+            }
+        }
+    }
+
+    // 轮 3/4：不要求网关，全适配器扫描（APIPA/回环由地址段判定排除）
+    if relaxed {
+        extract_lan_ipv4(text)
+    } else {
+        extract_ipv4_where(text, is_rfc1918_ipv4)
+    }
 }
 
 /// 依据系统路由表找到第一条默认 IPv4 出口，再读取该接口的第一个内网 IPv4。
@@ -100,62 +209,47 @@ fn extract_windows_default_route_ip(text: &str) -> Option<String> {
 fn get_default_lan_ip() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        // 第一优先级：直接读取 Windows 活动 IPv4 路由表，取默认路由的接口地址。
+        // 第一优先级：读取 Windows 活动 IPv4 路由表，按跃点数选默认路由的接口地址。
         if let Ok(output) = Command::new("route")
             .args(["print", "-4"])
             .creation_flags(0x08000000)
             .output()
         {
             if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                if let Some(ip) = extract_windows_default_route_ip(&text) {
+                if let Some(ip) = extract_windows_default_route_ip(&decode_console(&output.stdout)) {
                     return Some(ip);
                 }
             }
         }
 
-        // 第二优先级：PowerShell 获取存在默认网关的网卡 IPv4。
+        // 第二优先级：PowerShell 按路由度量取真实 IPv4 出口网卡地址（与系统选路一致）。
         if let Ok(output) = Command::new("powershell")
             .args([
                 "-NoProfile", "-NonInteractive", "-Command",
-                "(Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null} | Sort-Object InterfaceIndex | Select-Object -First 1).IPv4Address.IPAddress",
+                "$r=Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1; if($r){(Get-NetIPAddress -InterfaceIndex $r.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -notlike '169.254*' -and $_.IPAddress -notlike '127*'} | Select-Object -First 1).IPAddress}",
             ])
             .creation_flags(0x08000000)
             .output()
         {
             if output.status.success() {
-                if let Some(ip) = extract_ipv4(&String::from_utf8_lossy(&output.stdout)) {
+                if let Some(ip) = extract_lan_ipv4(&decode_console(&output.stdout)) {
                     return Some(ip);
                 }
             }
         }
 
-        // 第三优先级：解析 ipconfig 中包含默认网关的适配器 IPv4。
+        // 第三优先级：解析 ipconfig，严格 RFC1918 优先、宽松（CGNAT/无网关局域网卡）兜底。
         if let Ok(output) = Command::new("ipconfig")
             .creation_flags(0x08000000)
             .output()
         {
             if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                let mut candidate = None;
-                let mut has_gateway = false;
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        has_gateway = false;
-                        candidate = None;
-                        continue;
-                    }
-                    if trimmed.contains("IPv4") && trimmed.contains(':') {
-                        candidate = extract_ipv4(trimmed);
-                    } else if trimmed.contains("默认网关") || trimmed.contains("Default Gateway") {
-                        has_gateway = extract_ipv4(trimmed).is_some();
-                    }
-                    if has_gateway {
-                        if let Some(ip) = candidate.take() {
-                            return Some(ip);
-                        }
-                    }
+                let text = decode_console(&output.stdout);
+                if let Some(ip) = extract_ipconfig_ip(&text, false) {
+                    return Some(ip);
+                }
+                if let Some(ip) = extract_ipconfig_ip(&text, true) {
+                    return Some(ip);
                 }
             }
         }
@@ -166,19 +260,19 @@ fn get_default_lan_ip() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let route = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
-        let route_text = String::from_utf8_lossy(&route.stdout);
+        let route_text = decode_console(&route.stdout);
         let interface = route_text
             .lines()
             .find_map(|line| line.trim().strip_prefix("interface: "))?
             .trim();
         let output = Command::new("ipconfig").args(["getifaddr", interface]).output().ok()?;
-        return extract_ipv4(&String::from_utf8_lossy(&output.stdout));
+        return extract_lan_ipv4(&decode_console(&output.stdout));
     }
 
     #[cfg(target_os = "linux")]
     {
         let route = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
-        let route_text = String::from_utf8_lossy(&route.stdout);
+        let route_text = decode_console(&route.stdout);
         let interface = route_text
             .lines()
             .find_map(|line| {
@@ -189,7 +283,7 @@ fn get_default_lan_ip() -> Option<String> {
             .args(["-4", "-o", "addr", "show", "dev", interface, "scope", "global"])
             .output()
             .ok()?;
-        return extract_ipv4(&String::from_utf8_lossy(&output.stdout));
+        return extract_lan_ipv4(&decode_console(&output.stdout));
     }
 
     #[allow(unreachable_code)]
@@ -203,13 +297,21 @@ impl Reporter {
     }
 
     /// 获取公网出口 IPv4，仅用于向 online.php 上报客户端公网来源地址。
+    /// 多端点冗余：ip.sb 在部分大陆网络不可达（DNS 污染/连接超时），此前只依赖它会
+    /// 导致 public_ip 一直为空、上报循环整体不执行——线上"看不到任何上报记录"的主因。
     pub async fn get_public_ip(&self) -> Option<String> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(6))
             .build()
             .ok()?;
 
-        for url in ["https://api-ipv4.ip.sb/ip", "https://api.ip.sb/ip"] {
+        const ENDPOINTS: [&str; 4] = [
+            "https://api-ipv4.ip.sb/ip",   // 原端点，海外
+            "https://4.ipw.cn",            // 国内直连，返回纯 IPv4
+            "https://ipv4.icanhazip.com",  // Cloudflare 支持
+            "http://ip.3322.net",          // 纯 HTTP 最后兜底（仅回显 IP，无敏感数据）
+        ];
+        for url in ENDPOINTS {
             let resp = match client.get(url).send().await {
                 Ok(r) => r,
                 Err(_) => continue,

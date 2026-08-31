@@ -8,6 +8,16 @@ use crate::net;
 use crate::reporter::Reporter;
 use crate::state::AppState;
 
+/// 记录客户端运行事件（内网IP/公网IP/上报状态等）到 UI 可见日志，最多保留 100 条。
+fn log_event(state: &AppState, msg: impl Into<String>) {
+    if let Ok(mut logs) = state.sys_logs.lock() {
+        if logs.len() >= 100 {
+            logs.remove(0);
+        }
+        logs.push(msg.into());
+    }
+}
+
 fn build_dtos(groups: &[CoinGroup], selected: &[String], ip: &str) -> Vec<CoinGroupDto> {
     let selected_set: HashSet<String> = selected.iter().cloned().collect();
     groups
@@ -226,7 +236,21 @@ pub fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 
 #[tauri::command]
 pub fn get_logs(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(state.gost.get_logs())
+    // 系统事件日志（内网IP/公网IP/上报状态）与 gost 隧道日志合并展示，系统日志在前
+    let sys = state.sys_logs.lock().unwrap().join("\n");
+    let gost = state.gost.get_logs();
+    let mut parts: Vec<String> = Vec::new();
+    if !sys.is_empty() {
+        parts.push("[系统事件]".to_string());
+        parts.push(sys);
+    }
+    if !gost.is_empty() {
+        if !parts.is_empty() {
+            parts.push(String::new());
+        }
+        parts.push(gost);
+    }
+    Ok(parts.join("\n"))
 }
 
 #[tauri::command]
@@ -234,7 +258,7 @@ pub fn get_status(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
     let cur = *state.state.lock().unwrap();
     let miners = *state.miners.lock().unwrap();
     let ports = state.ports.lock().unwrap().clone();
-    let has_logs = state.gost.has_logs();
+    let has_logs = state.gost.has_logs() || !state.sys_logs.lock().unwrap().is_empty();
     let delay1 = *state.delay1.lock().unwrap();
     let delay2 = *state.delay2.lock().unwrap();
     let coins = state.coin_miners.lock().unwrap().clone();
@@ -269,19 +293,29 @@ pub fn get_app_version() -> String {
 
 /// 后台任务：5s 按币种统计矿机 + 10s 上报 + 30s 定时测延迟（启动即持续上报）
 pub fn start_background_tasks(app: AppHandle) {
-    // 启动时读取本机默认出口网卡内网 IP，仅用于 UI 显示。
+    // 启动时读取本机默认出口网卡内网 IP，仅用于 UI 显示；结果写入系统事件日志便于排障。
     let app_lan_ip = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Some(ip) = Reporter.get_local_ip() {
-            *app_lan_ip.state::<AppState>().lan_ip.lock().unwrap() = ip;
+        let st = app_lan_ip.state::<AppState>();
+        match Reporter.get_local_ip() {
+            Some(ip) => {
+                *st.lan_ip.lock().unwrap() = ip.clone();
+                log_event(&*st, format!("内网IP检测成功: {}", ip));
+            }
+            None => log_event(&*st, "内网IP检测失败（route/PowerShell/ipconfig 均未命中）".to_string()),
         }
     });
 
-    // 启动即上报：单独获取公网出口 IP，仅用于 online.php 上报。
+    // 启动即上报：单独获取公网出口 IP，仅用于 online.php 上报；结果写入日志。
     let app_public_ip = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Some(ip) = Reporter.get_public_ip().await {
-            *app_public_ip.state::<AppState>().public_ip.lock().unwrap() = ip;
+        let st = app_public_ip.state::<AppState>();
+        match Reporter.get_public_ip().await {
+            Some(ip) => {
+                *st.public_ip.lock().unwrap() = ip.clone();
+                log_event(&*st, format!("公网IP获取成功: {}", ip));
+            }
+            None => log_event(&*st, "公网IP获取失败（4 个端点均不可达，将不上报）".to_string()),
         }
     });
 
@@ -322,19 +356,39 @@ pub fn start_background_tasks(app: AppHandle) {
     let app_report = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut last_public_ip_refresh = Instant::now() - Duration::from_secs(601);
+        let mut last_report_err: Option<String> = None; // 上报失败去重，避免每 10s 刷屏
         loop {
             let st = app_report.state::<AppState>();
             if last_public_ip_refresh.elapsed() >= Duration::from_secs(600) {
-                if let Some(ip) = Reporter.get_public_ip().await {
-                    *st.public_ip.lock().unwrap() = ip;
-                    last_public_ip_refresh = Instant::now();
+                match Reporter.get_public_ip().await {
+                    Some(ip) => {
+                        *st.public_ip.lock().unwrap() = ip;
+                        last_public_ip_refresh = Instant::now();
+                    }
+                    None => {
+                        // 失败也推进计时，避免每 10s 都重试 4 个端点拖慢循环
+                        last_public_ip_refresh = Instant::now();
+                    }
                 }
             }
             let ip = st.public_ip.lock().unwrap().clone();
             let miners = *st.miners.lock().unwrap();
             let coin_miners = st.coin_miners.lock().unwrap().clone();
             if !ip.is_empty() {
-                let _ = Reporter.report(&ip, miners, &coin_miners).await;
+                match Reporter.report(&ip, miners, &coin_miners).await {
+                    Ok(()) => {
+                        if last_report_err.is_some() {
+                            log_event(&*st, "上报恢复".to_string());
+                            last_report_err = None;
+                        }
+                    }
+                    Err(e) => {
+                        if last_report_err.as_deref() != Some(e.as_str()) {
+                            log_event(&*st, format!("上报失败: {}", e));
+                            last_report_err = Some(e);
+                        }
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
@@ -348,10 +402,20 @@ pub fn start_background_tasks(app: AppHandle) {
             let st = app_ping.state::<AppState>();
             let _ = measure_delays(&st).await;
             // 内网 IP 获取为阻塞系统命令，放入 spawn_blocking
-            if let Ok(Some(ip)) =
-                tauri::async_runtime::spawn_blocking(|| Reporter.get_local_ip()).await
-            {
-                *st.lan_ip.lock().unwrap() = ip;
+            let new_ip = tauri::async_runtime::spawn_blocking(|| Reporter.get_local_ip()).await;
+            if let Ok(Some(ip)) = new_ip {
+                let changed = {
+                    let mut guard = st.lan_ip.lock().unwrap();
+                    if *guard != ip {
+                        *guard = ip.clone();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    log_event(&*st, format!("内网IP已更新: {}", ip));
+                }
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }

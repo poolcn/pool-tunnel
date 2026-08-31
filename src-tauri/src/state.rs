@@ -26,6 +26,8 @@ pub struct AppState {
     pub delay1: Mutex<Option<u32>>,
     /// 加密隧道二（server2）延迟 ms
     pub delay2: Mutex<Option<u32>>,
+    /// 客户端运行事件日志（内网IP/公网IP/上报状态等），与 gost 日志一并在 UI 显示，上限 100 条
+    pub sys_logs: Mutex<Vec<String>>,
 }
 
 impl AppState {
@@ -43,6 +45,7 @@ impl AppState {
             miners: Mutex::new(0),
             delay1: Mutex::new(None),
             delay2: Mutex::new(None),
+            sys_logs: Mutex::new(Vec::new()),
         }
     }
 }
