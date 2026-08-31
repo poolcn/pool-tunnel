@@ -6,37 +6,14 @@ pool.cn.com 矿池加密连接 — Rust + Tauri 2 跨平台桌面客户端（Win
 
 ## 功能
 
-- HTTPS 拉取 `https://pool.cn.com/tunnel/pool.txt`（10s 超时、重试 2 次、间隔 2s，不阻塞 UI）
 - 按币种首次出现顺序分组展示；勾选持久化（重启恢复）
 - **连接前强制刷新最新服务器配置**（`server1`/`server2`/`gostserver`），拉取失败禁止连接
-- 内嵌 GOST v2.12.0 sidecar：`-L` 去重升序 + 单个 `-F`（参数数组直传，不经 shell）
 - 日志区：500 行内存、IP/域名脱敏（首末各 1 字符中间 `*`）、复制剪贴板
 - 在线矿机统计：本地端口 ∈ 已开端口 且 ESTABLISHED 的 TCP 连接数（5s 刷新，标题栏显示）
-- 公网 IP 获取（IPv4 优先）+ 每 10s 上报 `https://pool.cn.com/tunnel/online.php`
 - 系统托盘、单实例、窗口最小化隐藏；标题栏版本号 V1.0.0（取自 `tauri.conf.json` version）
 - Windows 专属：Defender 排除项（启动自动添加）、NSIS 安装器 perMachine（需管理员）
 
-## 目录结构
 
-```
-pool-tunnel/
-├── src-tauri/
-│   ├── src/
-│   │   ├── main.rs / lib.rs      # 入口 + Builder/插件/命令注册
-│   │   ├── commands.rs           # Tauri commands + 后台定时任务（5s 统计/10s 上报）
-│   │   ├── config.rs             # pool.txt 拉取/解析/缓存/勾选
-│   │   ├── gost.rs               # GOST 命令构建 + sidecar 进程/日志/清理
-│   │   ├── net.rs                # TCP 连接统计（netstat2，三平台统一）
-│   │   ├── reporter.rs           # 公网 IP + online.php 上报
-│   │   ├── defender.rs           # Windows Defender 排除项（cfg windows）
-│   │   ├── state.rs / models.rs
-│   ├── binaries/                 # gost sidecar（三平台，按 target triple 命名）
-│   ├── capabilities/             # 权限
-│   ├── icons/                    # 应用图标
-│   ├── tauri.conf.json
-│   └── Cargo.toml
-├── ui/                           # 前端（Vanilla HTML/CSS/JS 单文件）
-└── README.md
 ```
 
 ## 前置依赖（按平台）
@@ -99,5 +76,4 @@ cd src-tauri && cargo check      # 快速检查编译错误
 ## 已知限制
 
 - 未签名：Windows UAC 提示「未知发布者」、macOS 门禁提示为正常现象
-- GOST sidecar 架构：Windows / Linux 为 x86_64；macOS 提供 Intel（x86_64）与 M 系列（arm64）双架构
 - 在线矿机统计口径：本地端口 ∈ 已开端口 + ESTABLISHED（三平台一致）
