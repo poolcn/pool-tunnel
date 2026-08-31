@@ -219,7 +219,8 @@ impl Reporter {
             }
             if let Ok(text) = resp.text().await {
                 let ip = text.trim().to_string();
-                if !ip.is_empty() {
+                // 校验返回确实是合法 IPv4，避免异常响应体（如错误页）被当作公网 IP 缓存并持续上报
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() {
                     return Some(ip);
                 }
             }

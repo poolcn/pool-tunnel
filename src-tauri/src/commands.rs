@@ -55,10 +55,17 @@ fn ping_host(addr: &str) -> Option<u32> {
 }
 
 /// 测量当前 server1/server2 延迟并写入共享状态。
+/// ping 是阻塞系统调用（双服务器串行约 8-10s），放入 spawn_blocking 避免阻塞 async 运行时。
 async fn measure_delays(state: &AppState) -> (Option<u32>, Option<u32>) {
     let server = state.server.lock().unwrap().clone();
     let (d1, d2) = match server {
-        Some(s) => (ping_host(&s.server1), ping_host(&s.server2)),
+        Some(s) => {
+            let s1 = s.server1.clone();
+            let s2 = s.server2.clone();
+            tauri::async_runtime::spawn_blocking(move || (ping_host(&s1), ping_host(&s2)))
+                .await
+                .unwrap_or((None, None))
+        }
         None => (None, None),
     };
     if let Some(v) = d1 {
@@ -113,6 +120,7 @@ pub async fn refresh_config(state: State<'_, AppState>) -> Result<serde_json::Va
         "groups": build_dtos(&groups, &selected, &ip),
         "server": server,
         "errors": errors,
+        "selected": selected,
         "delay1": delay1,
         "delay2": delay2,
     }))
@@ -173,7 +181,11 @@ pub async fn start_tunnel(
                 if !ports.contains(&e.port) {
                     ports.push(e.port);
                 }
-                coin_ports.entry(e.coin.clone()).or_default().push(e.port);
+                // 每币种端口去重，避免同一端口连接数被重复累计
+                let plist = coin_ports.entry(e.coin.clone()).or_default();
+                if !plist.contains(&e.port) {
+                    plist.push(e.port);
+                }
             }
         }
     }
@@ -273,11 +285,18 @@ pub fn start_background_tasks(app: AppHandle) {
         }
     });
 
-    // 5s 矿机统计（按币种维度）
+    // 5s 矿机统计（按币种维度）+ gost 存活检测
     let app_miners = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             let st = app_miners.state::<AppState>();
+            // 存活检测：gost 崩溃后状态由 Running 置为 Failed，避免 UI 假运行
+            if *st.state.lock().unwrap() == TunnelState::Running && st.gost.has_exited() {
+                st.ports.lock().unwrap().clear();
+                st.coin_ports.lock().unwrap().clear();
+                st.coin_miners.lock().unwrap().clear();
+                *st.state.lock().unwrap() = TunnelState::Failed;
+            }
             let ports = st.ports.lock().unwrap().clone();
             let by_port = net::count_by_port(&ports);
             let coin_ports = st.coin_ports.lock().unwrap().clone();
@@ -321,13 +340,19 @@ pub fn start_background_tasks(app: AppHandle) {
         }
     });
 
-    // 30s 定时测延迟；启动首次测量由 get_initial_state 完成。
+    // 30s 定时测延迟 + 刷新内网 IP（网络切换/DHCP 变化后保持最新）；启动首次测量由 get_initial_state 完成。
     let app_ping = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
         loop {
             let st = app_ping.state::<AppState>();
             let _ = measure_delays(&st).await;
+            // 内网 IP 获取为阻塞系统命令，放入 spawn_blocking
+            if let Ok(Some(ip)) =
+                tauri::async_runtime::spawn_blocking(|| Reporter.get_local_ip()).await
+            {
+                *st.lan_ip.lock().unwrap() = ip;
+            }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });

@@ -107,7 +107,7 @@ async function init() {
       try {
         const fresh = await invoke('refresh_config');
         groups = fresh.groups || [];
-        selected = new Set(fresh.selected || []);
+        keepValidSelection();
         renderTabs();
         renderContent();
         updateSummary();
@@ -289,13 +289,20 @@ async function doStop() {
   }
 }
 
+// 刷新列表后保留勾选：过滤掉已不在新列表中的 key，避免刷新清空用户勾选
+function keepValidSelection() {
+  const validKeys = new Set();
+  groups.forEach(g => g.items.forEach(i => validKeys.add(i.key)));
+  selected = new Set(Array.from(selected).filter(k => validKeys.has(k)));
+}
+
 async function doRefresh() {
   const note = document.getElementById('dataNote');
   note.textContent = '正在刷新列表...';
   try {
     const data = await invoke('refresh_config');
     groups = data.groups || [];
-    selected = new Set(data.selected || []);
+    keepValidSelection();
     currentTab = 0;
     note.textContent = '';
     renderTabs(); renderContent(); updateSummary();

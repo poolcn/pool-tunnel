@@ -48,6 +48,12 @@ pub fn run() {
             commands::ping_delay,
             commands::get_app_version,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // 应用退出前停止 gost 子进程，避免孤儿进程占用端口/继续转发
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                app_handle.state::<state::AppState>().gost.stop(app_handle);
+            }
+        });
 }

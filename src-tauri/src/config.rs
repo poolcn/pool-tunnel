@@ -120,10 +120,13 @@ impl ConfigService {
     }
 
     pub fn save_cache(&self, content: &str) {
-        if let Some(dir) = self.data_dir.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        // 必须创建 data_dir 本身（缓存文件直接写在其内）；失败时输出日志而非静默吞掉
+        if let Err(e) = std::fs::create_dir_all(&self.data_dir) {
+            eprintln!("create data dir failed: {}", e);
         }
-        let _ = std::fs::write(self.cache_path(), content);
+        if let Err(e) = std::fs::write(self.cache_path(), content) {
+            eprintln!("save pool cache failed: {}", e);
+        }
     }
 
     pub fn load_selected(&self) -> Vec<String> {
@@ -132,9 +135,11 @@ impl ConfigService {
     }
 
     pub fn save_selected(&self, keys: &[String]) {
-        if let Some(dir) = self.data_dir.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(&self.data_dir) {
+            eprintln!("create data dir failed: {}", e);
         }
-        let _ = std::fs::write(self.config_path(), serde_json::to_string(keys).unwrap_or_default());
+        if let Err(e) = std::fs::write(self.config_path(), serde_json::to_string(keys).unwrap_or_default()) {
+            eprintln!("save selected config failed: {}", e);
+        }
     }
 }

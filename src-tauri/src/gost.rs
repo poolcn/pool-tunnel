@@ -165,10 +165,10 @@ impl GostManager {
         Ok(())
     }
 
-    /// 停止：Windows 杀整个进程树；unix kill；随后按进程名清理残留
+    /// 停止：Windows 杀整个进程树；unix kill；wait 回收子进程避免僵尸；随后按进程名清理残留
     pub fn stop(&self, _app: &AppHandle) {
         let child = self.child.lock().unwrap().take();
-        if let Some(c) = child {
+        if let Some(mut c) = child {
             #[cfg(target_os = "windows")]
             {
                 let _ = Command::new("taskkill")
@@ -178,11 +178,30 @@ impl GostManager {
             }
             #[cfg(not(target_os = "windows"))]
             {
-                let mut c = c;
                 let _ = c.kill();
             }
+            let _ = c.wait();
         }
         self.kill_residual();
+    }
+
+    /// 检测 gost 子进程是否已退出；退出则回收句柄并返回 true。
+    /// 锁被毒化或未启动时返回 false（不误判为崩溃）。
+    pub fn has_exited(&self) -> bool {
+        let mut guard = match self.child.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        match guard.as_mut() {
+            Some(c) => match c.try_wait() {
+                Ok(Some(_)) => {
+                    guard.take();
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
     }
 
     /// 按进程名清理残留（Windows 用 taskkill /T /F；unix 用 pkill -x）
