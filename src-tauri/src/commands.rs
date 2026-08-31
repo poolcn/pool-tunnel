@@ -100,9 +100,12 @@ pub async fn get_initial_state(state: State<'_, AppState>) -> Result<serde_json:
     };
     let selected = state.config.load_selected();
     *state.server.lock().unwrap() = Some(server.clone());
-    let ip = state.lan_ip.lock().unwrap().clone();
     let running = *state.state.lock().unwrap() == TunnelState::Running;
     let (delay1, delay2) = measure_delays(&state).await;
+    // 必须在 measure_delays（ping 阻塞约 8-10s）之后才读取 lan_ip，用最新值构建 DTO。
+    // 否则前端 init() 先收到 lan-ip-updated 事件渲染出正确 IP，随后本函数用 ping 前读取的
+    // 旧空 IP 覆盖回去，导致 Win10 上状态文本被刷成「未检测到可用 IPv4」。
+    let ip = state.lan_ip.lock().unwrap().clone();
     Ok(serde_json::json!({
         "groups": build_dtos(&groups, &selected, &ip),
         "server_complete": server.is_complete(),
@@ -435,9 +438,10 @@ pub fn start_background_tasks(app: AppHandle) {
                 };
                 if changed {
                     log_event(&*st, format!("内网IP已更新: {}", ip));
-                    // 内网IP变更（DHCP续租/网络切换）通知前端刷新 endpoint
-                    let _ = app_ping.emit("lan-ip-updated", &ip);
                 }
+                // 每 30s 无条件通知前端刷新 endpoint（IP 变更时或作兜底恢复），
+                // 确保 UI 因竞态被覆盖成「未检测到可用 IPv4」后能自动恢复正常。
+                let _ = app_ping.emit("lan-ip-updated", &ip);
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
