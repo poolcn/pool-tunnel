@@ -1,13 +1,12 @@
 # pool-tunnel
 
-pool.cn.com 矿池加密连接 — Rust + Tauri 2 跨平台桌面客户端（Windows / macOS / Ubuntu）。
+Rust + Tauri 2 跨平台桌面客户端（Windows / macOS / Ubuntu）。
 
-原 .NET Framework 4.8 WPF 版（`tunnel.exe`）的跨平台重构：拉取矿池列表、按币种选择端口、启动内嵌 GOST（sidecar）建立加密转发隧道，支持在线矿机统计与上报。
+原 .NET Framework 4.8 WPF 版（`tunnel.exe`）的跨平台重构：拉取矿池列表、按币种选择端口，支持在线矿机统计与上报。
 
 ## 功能
 
 - 按币种首次出现顺序分组展示；勾选持久化（重启恢复）
-- **连接前强制刷新最新服务器配置**（`server1`/`server2`/`gostserver`），拉取失败禁止连接
 - 日志区：500 行内存、IP/域名脱敏（首末各 1 字符中间 `*`）、复制剪贴板
 - 在线矿机统计：本地端口 ∈ 已开端口 且 ESTABLISHED 的 TCP 连接数（5s 刷新，标题栏显示）
 - 系统托盘、单实例、窗口最小化隐藏；标题栏版本号 V1.0.0（取自 `tauri.conf.json` version）
@@ -71,7 +70,7 @@ cd src-tauri && cargo check      # 快速检查编译错误
 - Windows：`%APPDATA%\com.poolcn.tunnel\`
 - macOS：`~/Library/Application Support/com.poolcn.tunnel/`
 - Linux：`~/.local/share/com.poolcn.tunnel/`
-- 含 `pool_cache.txt`（矿池缓存）、`config.json`（勾选持久化）
+
 
 ## 已知限制
 
