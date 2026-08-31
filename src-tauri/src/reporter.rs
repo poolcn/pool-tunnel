@@ -19,7 +19,11 @@ fn detect_os_version() -> String {
             #[cfg(target_os = "windows")]
             {
                 // 优先 systeminfo 的 "OS 名称:" 行（含「专业版」「家庭版」等中文 SKU，需 GBK 解码）
-                if let Ok(output) = Command::new("systeminfo").output() {
+                // creation_flags(0x08000000) = CREATE_NO_WINDOW，避免弹出 CMD 黑窗
+                if let Ok(output) = Command::new("systeminfo")
+                    .creation_flags(0x08000000)
+                    .output()
+                {
                     let text = decode_console(&output.stdout);
                     for line in text.lines() {
                         let line = line.trim();
