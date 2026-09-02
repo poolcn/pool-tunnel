@@ -12,7 +12,9 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 获取操作系统版本；命令不可用或读取失败时返回稳定的系统名称兜底值。
 /// Windows 上使用 systeminfo 的 "OS 名称" 行（如「Microsoft Windows 11 专业版」），并用 decode_console
 /// 解码中文控制台的 GBK 输出，避免 from_utf8_lossy 把"[版]"或"专业版"打成 U+FFFD。
-fn detect_os_version() -> String {
+/// 注意：首次调用会同步执行 systeminfo（部分机器 10-60s），禁止在 async 上下文直接调用，
+/// 必须经 spawn_blocking（应用启动时已预热一次，之后命中 OnceLock 缓存）。
+pub(crate) fn detect_os_version() -> String {
     static OS_VERSION: OnceLock<String> = OnceLock::new();
     OS_VERSION
         .get_or_init(|| {
@@ -140,11 +142,23 @@ fn is_usable_ipv4(value: &str) -> bool {
 /// 失败时按 GBK 解码（中文 Windows 的 OEM 936 控制台输出）。
 /// 旧实现 from_utf8_lossy 会把"默认网关"等中文标签打成乱码，导致 ipconfig 阶段在
 /// 中文系统上永远匹配不到网关行——本次修复的关键点之一。
-fn decode_console(bytes: &[u8]) -> String {
+pub(crate) fn decode_console(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         Err(_) => encoding_rs::GBK.decode(bytes).0.to_string(),
     }
+}
+
+/// 共享 reqwest Client：复用连接池/TLS 会话，避免每 10s 上报都重建。
+/// 超时统一取各调用点最大值 10s（原 report 5s / get_public_ip 6s / fetch 10s）。
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// 从文本 token 中提取第一个满足谓词的 IPv4（自动剥离括号后缀如 "(首选)"）。
@@ -326,10 +340,7 @@ impl Reporter {
     /// 多端点冗余：ip.sb 在部分大陆网络不可达（DNS 污染/连接超时），此前只依赖它会
     /// 导致 public_ip 一直为空、上报循环整体不执行——线上"看不到任何上报记录"的主因。
     pub async fn get_public_ip(&self) -> Option<String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(6))
-            .build()
-            .ok()?;
+        let client = http_client();
 
         const ENDPOINTS: [&str; 4] = [
             "https://api-ipv4.ip.sb/ip",   // 原端点，海外
@@ -363,13 +374,13 @@ impl Reporter {
         miners: u32,
         coins: &HashMap<String, u32>,
     ) -> Result<(), String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = http_client();
 
         let coins_json = serde_json::to_string(coins).unwrap_or_else(|_| "{}".to_string());
-        let os_version = detect_os_version();
+        // systeminfo 为阻塞系统命令，必须经 spawn_blocking；正常已预热命中缓存，此调用近乎零开销
+        let os_version = tauri::async_runtime::spawn_blocking(detect_os_version)
+            .await
+            .unwrap_or_else(|_| "未知".to_string());
 
         let resp = client
             .post("https://pool.cn.com/tunnel/online.php")

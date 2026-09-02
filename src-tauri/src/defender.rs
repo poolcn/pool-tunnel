@@ -29,8 +29,9 @@ try {{
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text == "OK" || out.status.success() {
+    // 脚本 catch 分支已 exit 1，exit code 0 即成功；输出用 decode_console 兼容 GBK 错误信息
+    let text = crate::reporter::decode_console(&out.stdout).trim().to_string();
+    if out.status.success() {
         Ok(())
     } else {
         Err(format!(

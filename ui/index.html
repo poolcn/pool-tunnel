@@ -102,6 +102,10 @@ async function init() {
         updateSummary();
       } catch (e) { /* 静默忽略，避免日志刷屏 */ }
     });
+    // 首屏不再阻塞等待 ping：后端异步测量完成后经 delay-updated 推送
+    window.__TAURI__.event.listen('delay-updated', (e) => {
+      if (e.payload) updateDelayDisplay(e.payload.delay1, e.payload.delay2);
+    });
   } catch (e) { /* listen 失败不影响主流程 */ }
 
   try {
@@ -338,8 +342,10 @@ async function doCopy() {
 
 function flash(msg) {
   const st = document.getElementById('statusText');
+  const prev = st.textContent;
   st.textContent = msg;
-  setTimeout(() => { if (tunnelState === 'idle') st.textContent = '未连接'; else st.textContent = TEXTS[tunnelState]; }, 2000);
+  // 恢复之前的原文（如「已启动 N 个监听端口」），不再硬编码按状态覆盖
+  setTimeout(() => { if (st.textContent === msg) st.textContent = prev; }, 2000);
 }
 
 document.getElementById('btnStart').onclick = doStart;

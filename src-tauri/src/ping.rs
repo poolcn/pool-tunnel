@@ -26,14 +26,7 @@ pub fn ping_avg(host: &str) -> Option<u32> {
             .ok()?
     };
 
-    let text = if cfg!(target_os = "windows") {
-        // Windows 中文系统 ping 输出为 GBK 编码，需按 GBK 解码；否则"时间"被 from_utf8_lossy 变乱码导致匹配失败
-        use encoding_rs::GBK;
-        let (decoded, _, _) = GBK.decode(&output.stdout);
-        decoded.into_owned()
-    } else {
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    };
+    let text = crate::reporter::decode_console(&output.stdout);
     let times = extract_times(&text);
     if times.is_empty() {
         return None;

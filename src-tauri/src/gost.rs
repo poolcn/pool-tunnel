@@ -5,7 +5,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "windows"))]
+use tauri::Manager; // 仅非 Windows 分支用 app.path() 取应用数据目录
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -38,6 +40,8 @@ fn gost_file_name() -> &'static str {
 pub struct GostManager {
     child: Mutex<Option<Child>>,
     logs: Arc<Mutex<Vec<String>>>,
+    /// 本实例释放的 gost 完整路径（ensure_gost 后写入），残留清理按此路径过滤，避免误杀同名进程
+    gost_path: Mutex<Option<PathBuf>>,
 }
 
 impl GostManager {
@@ -45,6 +49,7 @@ impl GostManager {
         Self {
             child: Mutex::new(None),
             logs: Arc::new(Mutex::new(Vec::new())),
+            gost_path: Mutex::new(None),
         }
     }
 
@@ -68,8 +73,29 @@ impl GostManager {
         args
     }
 
+    /// 已存在的 gost 文件是否可用：大小与内嵌字节一致才复用。
+    /// 能发现半截文件（上次写入被强杀）与版本更替（大小几乎必然变化），避免损坏/旧版被永久复用。
+    fn gost_file_valid(target: &PathBuf) -> bool {
+        target
+            .metadata()
+            .map(|m| m.len() as usize == GOST_BIN.len())
+            .unwrap_or(false)
+    }
+
+    /// 原子写入 gost：先写临时文件再 rename，杜绝强杀留下半截可执行文件。
+    fn write_gost_atomic(target: &PathBuf) -> Result<(), String> {
+        let tmp = target.with_extension("tmp");
+        fs::write(&tmp, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
+        // Windows 上 rename 不能覆盖已存在目标，先删（窗口极小，且目标已判定为损坏/旧版）
+        if target.exists() {
+            let _ = fs::remove_file(target);
+        }
+        fs::rename(&tmp, target).map_err(|e| format!("替换 gost 失败: {}", e))?;
+        Ok(())
+    }
+
     /// 确保 gost 可执行文件就位：
-    /// - Windows：exe 同目录（免安装可写），存在则复用，否则从内嵌字节释放
+    /// - Windows：exe 同目录（免安装可写），存在且大小一致则复用，否则从内嵌字节原子释放
     /// - macOS/Linux：.app 包内目录只读，改释放到应用数据目录（~/.local/share 或 ~/Library/Application Support）
     fn ensure_gost(app: &AppHandle) -> Result<PathBuf, String> {
         #[cfg(target_os = "windows")]
@@ -81,10 +107,10 @@ impl GostManager {
                 .ok_or_else(|| "无法定位程序目录".to_string())?
                 .to_path_buf();
             let target = exe_dir.join(gost_file_name());
-            if target.exists() {
+            if Self::gost_file_valid(&target) {
                 return Ok(target);
             }
-            fs::write(&target, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
+            Self::write_gost_atomic(&target)?;
             return Ok(target);
         }
         #[cfg(not(target_os = "windows"))]
@@ -95,10 +121,9 @@ impl GostManager {
                 .map_err(|e| format!("无法获取应用数据目录: {}", e))?;
             fs::create_dir_all(&data_dir).map_err(|e| format!("创建数据目录失败: {}", e))?;
             let target = data_dir.join(gost_file_name());
-            if target.exists() {
-                return Ok(target);
+            if !Self::gost_file_valid(&target) {
+                Self::write_gost_atomic(&target)?;
             }
-            fs::write(&target, GOST_BIN).map_err(|e| format!("释放 gost 失败: {}", e))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -123,11 +148,13 @@ impl GostManager {
             }
         }
 
-        // 防御：清理残留 gost 进程，避免端口占用
+        // 确保 gost 就位（Windows exe 同目录 / macOS·Linux 应用数据目录，大小一致才复用否则原子释放）
+        let gost_path = Self::ensure_gost(app)?;
+        *self.gost_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(gost_path.clone());
+
+        // 防御：清理残留 gost 进程（仅限本实例释放路径），避免端口占用
         self.kill_residual();
 
-        // 确保 gost 就位（Windows exe 同目录 / macOS·Linux 应用数据目录，存在则用否则释放）
-        let gost_path = Self::ensure_gost(app)?;
         let args = Self::build_args(ports, server);
 
         let mut cmd = Command::new(&gost_path);
@@ -167,7 +194,7 @@ impl GostManager {
 
     /// 停止：Windows 杀整个进程树；unix kill；wait 回收子进程避免僵尸；随后按进程名清理残留
     pub fn stop(&self, _app: &AppHandle) {
-        let child = self.child.lock().unwrap().take();
+        let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut c) = child {
             #[cfg(target_os = "windows")]
             {
@@ -204,37 +231,51 @@ impl GostManager {
         }
     }
 
-    /// 按进程名清理残留（Windows 用 taskkill /T /F；unix 用 pkill -x）
+    /// 按完整路径清理残留：只杀本实例释放的 gost，绝不误杀用户机器上其他同名代理工具。
+    /// 路径未知（从未成功 ensure_gost）时直接跳过——没有我们的释放路径就没有我们的残留。
     fn kill_residual(&self) {
+        let path = self
+            .gost_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(path) = path else { return };
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/IM", "gost.exe"])
+            let escaped = path.to_string_lossy().replace("'", "''");
+            let script = format!(
+                "Get-CimInstance Win32_Process -Filter \"Name='gost.exe'\" | Where-Object {{ $_.ExecutablePath -eq '{}' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+                escaped
+            );
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                 .creation_flags(0x08000000)
                 .output();
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = Command::new("pkill").args(["-x", "gost"]).output();
+            // pkill -f 匹配完整命令行（含路径），只命中本实例释放的 gost
+            let pattern = path.to_string_lossy().into_owned();
+            let _ = Command::new("pkill").args(["-f", &pattern]).output();
         }
     }
 
     pub fn get_logs(&self) -> String {
-        self.logs.lock().unwrap().join("\n")
+        self.logs.lock().unwrap_or_else(|e| e.into_inner()).join("\n")
     }
 
     pub fn has_logs(&self) -> bool {
-        !self.logs.lock().unwrap().is_empty()
+        !self.logs.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     pub fn clear_logs(&self) {
-        self.logs.lock().unwrap().clear();
+        self.logs.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
 fn push_log(logs: &Mutex<Vec<String>>, line: String) {
     let masked = mask_addresses(&line);
-    let mut guard = logs.lock().unwrap();
+    let mut guard = logs.lock().unwrap_or_else(|e| e.into_inner());
     guard.push(masked);
     if guard.len() > MAX_LOG_LINES {
         let excess = guard.len() - MAX_LOG_LINES;
@@ -256,10 +297,18 @@ fn domain_re() -> &'static Regex {
 }
 
 /// 日志脱敏：IP/域名保留首末各 1 字符，中间以 * 代替（覆盖"不得脱敏"需求）
+/// 白名单：.exe 结尾的可执行文件名（如 gost.exe）不脱敏，避免排障时关键信息被误伤
 fn mask_addresses(line: &str) -> String {
     let step1 = ip_re().replace_all(line, |caps: &regex::Captures| mask_token(&caps[0]));
     domain_re()
-        .replace_all(&step1, |caps: &regex::Captures| mask_token(&caps[0]))
+        .replace_all(&step1, |caps: &regex::Captures| {
+            let token = &caps[0];
+            if token.to_ascii_lowercase().ends_with(".exe") {
+                token.to_string()
+            } else {
+                mask_token(token)
+            }
+        })
         .into_owned()
 }
 

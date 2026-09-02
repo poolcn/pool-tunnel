@@ -27,10 +27,8 @@ impl ConfigService {
 
     /// 拉取最新列表：10s 超时，失败重试 2 次，间隔 2s
     pub async fn fetch(&self) -> Result<String, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
+        // 共享 Client（10s 超时，复用连接池），避免每次重建 TLS 会话
+        let client = crate::reporter::http_client();
 
         let mut last_err = String::from("未知错误");
         for attempt in 0..=2 {
